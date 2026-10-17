@@ -1,0 +1,93 @@
+name: dbgw
+
+# Dev stack for db-tool: ParadeDB (PostgreSQL 17 with pg_search) + OpenFGA.
+#
+# Bring up:    docker compose up -d --wait
+# Bring down:  docker compose down -v
+#
+# Project name is forced to "dbgw" so the resulting containers are stable
+# regardless of the directory the file lives in.
+
+services:
+  paradedb:
+    image: paradedb/paradedb:0.26.2-pg17
+    container_name: dbgw-paradedb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - paradedb-data:/var/lib/postgresql/data
+    # pg_isready must talk TCP. During the initdb temp-server window
+    # ``listen_addresses=''`` so a Unix-socket probe can pass while the
+    # real server is still starting.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  openfga-db:
+    image: postgres:17.11
+    container_name: dbgw-openfga-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: openfga
+    expose:
+      - "5432"
+    volumes:
+      - openfga-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d openfga"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  openfga-migrate:
+    image: openfga/openfga:v1.22.0
+    container_name: dbgw-openfga-migrate
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: "postgres://postgres:postgres@openfga-db:5432/openfga?sslmode=disable"
+    entrypoint: ["/openfga"]
+    command: ["migrate"]
+    restart: "no"
+
+  openfga:
+    image: openfga/openfga:v1.22.0
+    container_name: dbgw-openfga
+    restart: unless-stopped
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+      openfga-migrate:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: "postgres://postgres:postgres@openfga-db:5432/openfga?sslmode=disable"
+      OPENFGA_HTTP_PLAYGROUND_ENABLED: "false"
+      OPENFGA_GRPC_ENABLED: "true"
+      OPENFGA_METRICS_ENABLED: "false"
+    command: ["run"]
+    ports:
+      - "127.0.0.1:58080:8080"
+    # The Chainguard static image ships only /openfga and
+    # /usr/local/bin/grpc_health_probe -- no shell, no wget/curl.
+    # grpc_health_probe hits OpenFGA's gRPC health endpoint on :8081 and
+    # returns the same SERVING status that /healthz returns over HTTP.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=127.0.0.1:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  paradedb-data:
+  openfga-db-data:
