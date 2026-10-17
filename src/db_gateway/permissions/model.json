@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user"
+    },
+    {
+      "type": "group",
+      "relations": {
+        "member": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "member": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "gateway",
+      "relations": {
+        "admin": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "db_schema",
+      "relations": {
+        "reader": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "group",
+                "relation": "member"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "db_table",
+      "relations": {
+        "reader": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "group",
+                "relation": "member"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row_set",
+      "relations": {
+        "table": {
+          "this": {}
+        },
+        "reader": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "table": {
+            "directly_related_user_types": [
+              {
+                "type": "db_table"
+              }
+            ]
+          },
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "group",
+                "relation": "member"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

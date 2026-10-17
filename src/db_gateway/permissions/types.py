@@ -4,19 +4,37 @@ Every op is idempotent: granting twice, revoking something absent, upserting
 an existing row_grants row or deleting a missing one all succeed and change
 nothing.
 
-Which role runs an op is given by run_as(owner_role): None means dbg_admin
-itself; otherwise the executor runs the op under SET ROLE <that role>.
-Object-privilege and RLS ops run as the connection's owner role; default
-privileges run as the role whose defaults they change.
+Replay safety (plan §2.1): the Syncer may replay old changes after the roles or
+objects they name are gone, and one failing op would stop the connection's
+token forever. So before running an op the executor checks what it names and
+skips (logging the reason) instead of failing:
+  - any op whose role (group role, member role, grantee) does not exist;
+  - any object-privilege or default-privilege op whose schema or table does not
+    exist;
+  - UpsertRowGrant whose group role does not exist (it would leave an orphan
+    row_grants row);
+  - EnableRowPolicy / DisableRowPolicy whose table does not exist.
+Never skipped: DeleteRowGrant and DropGroupRole. Deleting rows is idempotent,
+and skipping them would leave rows that a group recreated under the same name
+inherits (roles are cluster-global, so another connection may have dropped the
+role first). A DROP ROLE blocked by privileges in another database on the same
+cluster is a transient error: it is retried, not skipped.
+Order: the skip check comes first; for ops that run, a "no privileges were
+granted / revoked" WARNING is then an error (RevokeMembership has its own
+grantor rule, below).
+Everything else that errors is a real error.
 
-Role requirements per connection (checked when a connection is registered;
-a connection that fails them is refused):
-  - owner_role owns, or inherits the privileges of the owner of, every table in
-    the managed schemas: for every X in default_privilege_owners,
-    pg_has_role(owner_role, X, 'USAGE').
-  - dbg_admin can SET ROLE to owner_role and to every X in
-    default_privilege_owners: pg_has_role(dbg_admin, X, 'SET').
-  - dbg_admin has CREATEROLE (group roles) and ADMIN OPTION on gw_managed.
+Every op runs as the connection's admin account itself (no SET ROLE). That
+account is the database owner or a superuser, set up by hand by the operator;
+the gateway never migrates or escalates on the target DB. What it needs
+(docs/target-db-setup.md; targetdb.check reports what is missing):
+  - CREATEROLE and ADMIN OPTION on gw_managed (group roles, memberships);
+  - ownership of, or inherited membership in the owner of, every table in the
+    managed schemas (GRANT/REVOKE, ENABLE RLS, CREATE POLICY);
+  - membership in every role of default_privilege_owners (ALTER DEFAULT
+    PRIVILEGES FOR ROLE).
+If it lacks a privilege the op fails and the error is reported; it is not
+worked around.
 """
 
 from collections.abc import Mapping, Sequence
@@ -40,17 +58,10 @@ def user_role(user_id: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class PgOp:
-    def run_as(self, owner_role: str) -> str | None:
-        return None
+    pass
 
 
-@dataclass(frozen=True, slots=True)
-class _AsOwner(PgOp):
-    def run_as(self, owner_role: str) -> str | None:
-        return owner_role
-
-
-# --- roles and membership (dbg_admin) ---
+# --- roles and membership ---
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,14 +71,21 @@ class CreateGroupRole(PgOp):
 
 @dataclass(frozen=True, slots=True)
 class DropGroupRole(PgOp):
-    role: str  # DROP ROLE IF EXISTS <role>; the role holds no objects, only grants
+    """DELETE FROM gateway_acl.row_grants WHERE group_role = <role>, then DROP ROLE IF EXISTS.
+
+    Both in the same transaction, so no row_grants row outlives its role and a
+    group recreated under the same name starts with no row access. The role
+    holds no objects, only grants.
+    """
+
+    role: str
 
 
 @dataclass(frozen=True, slots=True)
 class GrantMembership(PgOp):
     """GRANT <group> TO <member>.
 
-    The executor skips it when <member> does not exist yet (a personal role is
+    The executor skips it when either role does not exist (a personal role is
     created at the user's first session, which then applies its memberships).
     """
 
@@ -77,44 +95,54 @@ class GrantMembership(PgOp):
 
 @dataclass(frozen=True, slots=True)
 class RevokeMembership(PgOp):
-    group: str  # skipped when either role does not exist
+    """REVOKE <group> FROM <member>.
+
+    PG16+ only removes a membership granted by the current role; anything else
+    is a WARNING and the member keeps access. So the executor reads
+    pg_auth_members first: no membership or either role missing → skip; granted
+    by the admin account → plain REVOKE; granted by another role → REVOKE ... GRANTED BY
+    <grantor> (the admin account holds ADMIN on group roles it created), and an error if
+    that is not possible.
+    """
+
+    group: str
     member: str
 
 
-# --- object privileges (owner role) ---
+# --- object privileges ---
 #
 # GRANT/REVOKE on objects the current role does not own only raises a WARNING
 # ("no privileges were granted"); the executor must treat that warning as an error.
 
 
 @dataclass(frozen=True, slots=True)
-class GrantSchemaUsage(_AsOwner):
+class GrantSchemaUsage(PgOp):
     schema: str
     role: str
 
 
 @dataclass(frozen=True, slots=True)
-class GrantTableSelect(_AsOwner):
-    schema: str
-    table: str
-    role: str
-
-
-@dataclass(frozen=True, slots=True)
-class RevokeTableSelect(_AsOwner):
+class GrantTableSelect(PgOp):
     schema: str
     table: str
     role: str
 
 
 @dataclass(frozen=True, slots=True)
-class GrantAllTablesSelect(_AsOwner):
+class RevokeTableSelect(PgOp):
+    schema: str
+    table: str
+    role: str
+
+
+@dataclass(frozen=True, slots=True)
+class GrantAllTablesSelect(PgOp):
     schema: str  # GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO <role>
     role: str
 
 
 @dataclass(frozen=True, slots=True)
-class RevokeAllTablesSelect(_AsOwner):
+class RevokeAllTablesSelect(PgOp):
     schema: str
     role: str
 
@@ -122,14 +150,11 @@ class RevokeAllTablesSelect(_AsOwner):
 @dataclass(frozen=True, slots=True)
 class GrantDefaultSelect(PgOp):
     """ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA <schema>
-    GRANT SELECT ON TABLES TO <role>. Runs as <owner>."""
+    GRANT SELECT ON TABLES TO <role>."""
 
     owner: str
     schema: str
     role: str
-
-    def run_as(self, owner_role: str) -> str | None:
-        return self.owner
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,9 +162,6 @@ class RevokeDefaultSelect(PgOp):
     owner: str
     schema: str
     role: str
-
-    def run_as(self, owner_role: str) -> str | None:
-        return self.owner
 
 
 # --- row-level security ---
@@ -165,7 +187,7 @@ class DeleteRowGrant(PgOp):
 
 
 @dataclass(frozen=True, slots=True)
-class EnableRowPolicy(_AsOwner):
+class EnableRowPolicy(PgOp):
     """ENABLE + FORCE RLS, CREATE POLICY gw_passthrough and gw_read, GRANT SELECT TO gw_managed."""
 
     schema: str
@@ -174,7 +196,7 @@ class EnableRowPolicy(_AsOwner):
 
 
 @dataclass(frozen=True, slots=True)
-class DisableRowPolicy(_AsOwner):
+class DisableRowPolicy(PgOp):
     """DROP both policies, NO FORCE + DISABLE RLS, REVOKE SELECT FROM gw_managed."""
 
     schema: str

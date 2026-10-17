@@ -139,9 +139,8 @@ async def test_names_immutable(conn: aiosqlite.Connection) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         await conn.execute("UPDATE groups SET name = ? WHERE name = ?", ("renamed", "a"))
     await conn.execute(
-        "INSERT INTO connections (name, host, dbname, admin_secret_ref, owner_role) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ("prod", "localhost", "postgres", "prod-admin", "owner"),
+        "INSERT INTO connections (name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?)",
+        ("prod", "localhost", "postgres", "prod-admin"),
     )
     async with conn.execute("SELECT default_privilege_owners FROM connections") as cur:
         assert await cur.fetchone() == ("[]",)
@@ -154,18 +153,16 @@ async def test_names_immutable(conn: aiosqlite.Connection) -> None:
 async def test_invalid_connection_names(conn: aiosqlite.Connection, name: str) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         await conn.execute(
-            "INSERT INTO connections (name, host, dbname, admin_secret_ref, owner_role) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (name, "localhost", "postgres", "secret", "owner"),
+            "INSERT INTO connections (name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?)",
+            (name, "localhost", "postgres", "secret"),
         )
 
 
 @pytest.mark.parametrize("name", ["a", "prod-main_123", "a" * 41])
 async def test_valid_connection_names(conn: aiosqlite.Connection, name: str) -> None:
     await conn.execute(
-        "INSERT INTO connections (name, host, dbname, admin_secret_ref, owner_role) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (name, "localhost", "postgres", "secret", "owner"),
+        "INSERT INTO connections (name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?)",
+        (name, "localhost", "postgres", "secret"),
     )
 
 
@@ -176,18 +173,18 @@ async def test_connection_privilege_owners_require_json_array(
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         await conn.execute(
             "INSERT INTO connections "
-            "(name, host, dbname, admin_secret_ref, owner_role, default_privilege_owners) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("prod", "localhost", "postgres", "secret", "owner", owners),
+            "(name, host, dbname, admin_secret_ref, default_privilege_owners) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("prod", "localhost", "postgres", "secret", owners),
         )
 
 
 async def test_connection_privilege_owners_array(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "INSERT INTO connections "
-        "(name, host, dbname, admin_secret_ref, owner_role, default_privilege_owners) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("prod", "localhost", "postgres", "secret", "owner", '["owner", "other_owner"]'),
+        "(name, host, dbname, admin_secret_ref, default_privilege_owners) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("prod", "localhost", "postgres", "secret", '["owner", "other_owner"]'),
     )
     async with conn.execute("SELECT default_privilege_owners FROM connections") as cur:
         assert await cur.fetchone() == ('["owner", "other_owner"]',)
@@ -255,23 +252,21 @@ async def test_connection_replace_rejected(
     conn: aiosqlite.Connection, verb: str, conflict: str
 ) -> None:
     await conn.execute(
-        "INSERT INTO connections (id, name, host, dbname, admin_secret_ref, owner_role) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (1, "original", "localhost", "postgres", "secret", "owner"),
+        "INSERT INTO connections (id, name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?, ?)",
+        (1, "original", "localhost", "postgres", "secret"),
     )
     async with conn.execute("SELECT * FROM connections") as cur:
         before = await cur.fetchall()
     with pytest.raises(sqlite3.IntegrityError):
         await conn.execute(
-            f"{verb} INTO connections (id, name, host, dbname, admin_secret_ref, owner_role) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            f"{verb} INTO connections (id, name, host, dbname, admin_secret_ref) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 1 if conflict == "id" else 2,
                 "forged" if conflict == "id" else "original",
                 "forged",
                 "postgres",
                 "secret",
-                "owner",
             ),
         )
     async with conn.execute("SELECT * FROM connections") as cur:
@@ -317,9 +312,8 @@ async def test_all_timestamp_columns_reject_noncanonical_values(
     valid = "2026-10-16T12:34:56.123Z"
     await conn.execute("INSERT INTO users (id, login_key) VALUES (?, ?)", (1, "alice"))
     await conn.execute(
-        "INSERT INTO connections (id, name, host, dbname, admin_secret_ref, owner_role) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (1, "prod", "localhost", "postgres", "secret", "owner"),
+        "INSERT INTO connections (id, name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?, ?)",
+        (1, "prod", "localhost", "postgres", "secret"),
     )
     await conn.execute(
         "INSERT INTO activations (id, user_id, reason, expires_at) VALUES (?, ?, ?, ?)",

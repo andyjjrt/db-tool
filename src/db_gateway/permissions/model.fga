@@ -1,0 +1,25 @@
+model
+  schema 1.1
+
+type user
+
+type group
+  relations
+    define member: [user]
+
+type gateway
+  relations
+    define admin: [user]
+
+type db_schema
+  relations
+    define reader: [group#member]
+
+type db_table
+  relations
+    define reader: [group#member]
+
+type row_set
+  relations
+    define table: [db_table]
+    define reader: [group#member]

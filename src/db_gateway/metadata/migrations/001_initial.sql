@@ -85,7 +85,6 @@ CREATE TABLE connections (
     dbname TEXT NOT NULL,
     sslmode TEXT NOT NULL DEFAULT 'require',
     admin_secret_ref TEXT NOT NULL,
-    owner_role TEXT NOT NULL,
     default_privilege_owners TEXT NOT NULL DEFAULT '[]'
         CHECK (json_valid(default_privilege_owners)
             AND json_type(default_privilege_owners) = 'array')

@@ -11,7 +11,7 @@
 - `RuleService`：群組、成員、表級規則、列級規則、admin 關係寫成 OpenFGA tuple，並在寫入前檢查規則衝突
 - tuple → PG 操作的映射（每筆 tuple 對應固定操作，Syncer 與 Reconciler 共用）
 - Syncer（`ReadChanges` → 逐筆套用）、Reconciler（全量比對）
-- 目標 DB 的 bootstrap：`gw_managed`、`gateway_acl` schema、`row_grants`、RLS 函式、PUBLIC 權限收回、`paradedb` 授權
+- 目標 DB 的設定 SQL（由操作者手動執行，見 `docs/target-db-setup.md`）與唯讀檢查 `targetdb.check`：`gw_managed`、`gateway_acl` schema、`row_grants`、RLS 函式、`paradedb` 授權
 - 列級受控表的宣告與取消
 - admin 規則（寫死的初始 admin、只有初始 admin 能移出）
 - §10 的管理 API：groups、grants、row-policies、sync、reconcile、drift、admins
@@ -93,7 +93,7 @@ type row_set
 
 不屬於任何 tuple、一次性的設定：
 
-- **bootstrap（每個目標 DB）**：`GRANT USAGE ON SCHEMA <各 schema> TO gw_managed`；`paradedb` 的 `USAGE` 與函式 `EXECUTE` 授給 `gw_managed`。Reconciler 發現新 schema 時補上 `USAGE`。
+- **目標 DB 設定（每個目標 DB，操作者手動執行）**：`GRANT USAGE ON SCHEMA <各 schema> TO gw_managed`；`paradedb` 的 `USAGE` 與函式 `EXECUTE` 授給 `gw_managed`。Reconciler 發現新 schema 缺 `USAGE` 時只回報，不自動補。
 - **宣告列級受控**（寫入 `row_policies`）：`ENABLE` + `FORCE ROW LEVEL SECURITY`、建立 `gw_passthrough` 與 `gw_read`、`GRANT SELECT ON s.t TO gw_managed`。
 - **取消列級受控**：`DROP POLICY` ×2、`NO FORCE` + `DISABLE ROW LEVEL SECURITY`、`REVOKE SELECT ON s.t FROM gw_managed`。
 
@@ -128,7 +128,7 @@ type row_set
 
 ```sql
 CREATE ROLE gw_managed NOLOGIN;              -- 所有 u_<id> 都是成員（Provisioner 建 role 時加入）
-CREATE SCHEMA gateway_acl AUTHORIZATION dbg_admin;
+CREATE SCHEMA gateway_acl AUTHORIZATION <連線管理帳號>;
 CREATE TABLE gateway_acl.row_grants (
   group_role  name NOT NULL,
   schema_name name NOT NULL,
@@ -142,19 +142,21 @@ GRANT USAGE ON SCHEMA gateway_acl TO PUBLIC;
 
 CREATE FUNCTION gateway_acl.is_managed() RETURNS boolean
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog
-  AS $$ SELECT pg_has_role(session_user, 'gw_managed', 'MEMBER') $$;
+  AS $$ SELECT pg_has_role(session_user, 'gw_managed', 'USAGE') $$;
 
 CREATE FUNCTION gateway_acl.allow_all(p_schema name, p_table name) RETURNS boolean
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog
-  AS $$ SELECT EXISTS (SELECT 1 FROM gateway_acl.row_grants
-          WHERE schema_name = p_schema AND table_name IN (p_table, '*') AND value = '*'
-            AND pg_has_role(session_user, group_role, 'MEMBER')) $$;
+  AS $$ SELECT EXISTS (SELECT 1 FROM gateway_acl.row_grants g
+          JOIN pg_catalog.pg_roles r ON r.rolname = g.group_role
+          WHERE g.schema_name = p_schema AND g.table_name IN (p_table, '*') AND g.value = '*'
+            AND pg_has_role(session_user, r.oid, 'USAGE')) $$;
 
 CREATE FUNCTION gateway_acl.allowed_values(p_schema name, p_table name) RETURNS text[]
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog
-  AS $$ SELECT coalesce(array_agg(DISTINCT value), '{}') FROM gateway_acl.row_grants
-          WHERE schema_name = p_schema AND table_name = p_table AND value <> '*'
-            AND pg_has_role(session_user, group_role, 'MEMBER') $$;
+  AS $$ SELECT coalesce(array_agg(DISTINCT g.value), '{}') FROM gateway_acl.row_grants g
+          JOIN pg_catalog.pg_roles r ON r.rolname = g.group_role
+          WHERE g.schema_name = p_schema AND g.table_name = p_table AND g.value <> '*'
+            AND pg_has_role(session_user, r.oid, 'USAGE') $$;
 
 -- 表宣告為列級受控時（以 owner 身分）
 ALTER TABLE s.t ENABLE ROW LEVEL SECURITY;
@@ -182,7 +184,7 @@ GRANT SELECT ON s.t TO gw_managed;
 - `ANY` 裡的子查詢必須加 `::text[]`，否則會被當成 `ANY (subquery)` 而報 `text = text[]` 錯誤
 - `gw_read` 不加 `TO gw_managed`：加了的話，使用者 `SET ROLE` 成群組 role 後會變 0 列
 - 函式 `EXECUTE` 保留給 PUBLIC：passthrough 需要每個 role 都能執行，`session_user` 讓它們只回傳呼叫者自己的結果
-- 啟用 RLS 與表權限的 `GRANT`/`REVOKE` 都需要 table owner（或 grant option）：連線設定加 `owner_role`，dbg_admin 需是它的成員。`PgOp.RUNS_AS_OWNER` 為真的 op 在 `SET ROLE owner_role` 下執行，其餘以 dbg_admin 執行。這是導入前要跟 DBA 談好的前提（規格 §15 已列）
+- 啟用 RLS 與表權限的 `GRANT`/`REVOKE` 都需要 table owner（或 grant option）。每個連線的管理帳號是該 DB 的 owner，也可能是 superuser，所有 op 都直接以它執行，不 `SET ROLE`。權限不足時 op 失敗並回報，不自動補權限（2026-10-17 決定）
 
 ### 2.6 OpenFGA 物件 id
 
@@ -228,8 +230,7 @@ src/db_gateway/
     syncer.py
     reconciler.py
   targetdb/
-    bootstrap.sql      # 2.5 的物件、PUBLIC 收回、paradedb 授權
-    bootstrap.py       # 冪等執行、版本記錄
+    check.py           # 唯讀檢查目標 DB 設定與管理帳號權限，回報缺項
   api/admin_permissions.py
 tests/
   unit/                # ids、mapping、rules 檢查、admin（不需外部服務）
@@ -244,9 +245,9 @@ tests/
 |---|---|---|---|
 | 1 | 專案骨架與 dev 環境 | uv 依賴（fastapi、psycopg[binary,pool]、openfga-sdk、pytest）、`docker-compose.yml`、SQLite migration（`groups`、`row_policies`、`sync_state` 與 M1 最小表） | `docker compose up` 後健康檢查通過 |
 | 2 | OpenFGA 模型與 store | `model.fga`、`ids.py`、`PermissionStore` 兩種實作；啟動時比對 model，不同則寫入新版並記錄 model id | id round-trip；兩種實作跑同一組合約測試（write/delete/read/read_changes/check） |
-| 3 | 目標 DB bootstrap | `bootstrap.sql`/`.py`：`gw_managed`、`gateway_acl`、函式、PUBLIC 收回、schema `USAGE` 與 `paradedb` 授權給 `gw_managed` | 重跑不報錯；PUBLIC 無 CONNECT；一般 role 讀不到 `row_grants` |
+| 3 | 目標 DB 設定與檢查 | `docs/target-db-setup.md`（操作者手動執行的 SQL）、`targetdb/check.py`（唯讀檢查，回報缺什麼）：`gw_managed`、`gateway_acl`、函式、schema `USAGE` 與 `paradedb` 授權給 `gw_managed` | 照文件設定後檢查無問題；缺項時檢查逐項回報；一般 role 讀不到 `row_grants` |
 | 4 | 映射 | `mapping.py`、`pg_ops.py` | 2.3 每一列一個單元測試；`revoke_ops(t)` 套用在 `grant_ops(t)` 之後回到原狀；ops 重複套用結果不變 |
-| 5 | 套用與實際狀態 | apply（`RUNS_AS_OWNER` 的 op 在 `SET ROLE owner_role` 下執行）、`actual.py` | 套用一組 tuple 後讀實際狀態 → 與期望狀態一致（收斂測試） |
+| 5 | 套用與實際狀態 | apply（以連線管理帳號直接執行，角色或物件不存在的 op 略過）、`actual.py` | 套用一組 tuple 後讀實際狀態 → 與期望狀態一致（收斂測試） |
 | 6 | RuleService 與 admin | 群組 CRUD（含 `CREATE ROLE g_<name>`）、成員、表級/列級規則、宣告/取消列級受控、admin 加入/移出 | 2.4 每條檢查各有拒絕測試（409）；parent tuple 隨第一筆/最後一筆 reader 寫入/刪除；每個操作有稽核；非初始 admin 移出 admin → 403 |
 | 7 | Syncer | `ReadChanges` 迴圈、`sync_state`、退避、API 內收回（5 秒 → 202） | 收回後 5 秒內 PG 生效；OpenFGA 停掉時查詢正常、管理 API 503；從舊 token 重放後狀態正確 |
 | 8 | Reconciler | 全量比對、drift 偵測與修正、dry_run、新 schema 補 `USAGE` | 手動 `GRANT` 一張表 → drift 出現 → reconcile 後消失並有稽核 |
@@ -288,7 +289,7 @@ tests/
 
 ## 7. 風險
 
-- dbg_admin 取得 owner 權限的方式沒談定之前，第 5 步的 RLS 部分無法在真實環境驗證（dev 容器可以）
+- 管理帳號的權限由操作者手動設定；檢查只能回報缺什麼，無法替他補
 - OpenFGA `ReadChanges` 的變更保留期限：若 Syncer 長時間停擺而 token 過期，退回跑一次全量 Reconcile 再從最新位置開始
 - 列級受控表對所有 gateway 使用者可見（0 列）：會出現在 SQL editor 的表清單裡，表名本來就能從系統目錄看到（§13 已接受）
 
@@ -299,3 +300,13 @@ tests/
 - 映射沒有額外邏輯：移除 `scoped_reader` 與交集；衝突在寫入時檢查並拒絕
 - 列級受控表的 `SELECT` 授予 `gw_managed`，沒有規則的人看到 0 列而不是 `permission denied`
 - `row_set#table` 保留，用來判斷所屬的表，不解析物件 id
+
+## 9. 已確認的決定（2026-10-17，W2 gate 後）
+
+- 不收回 PUBLIC 的 `CONNECT`：使用者只能經 gateway 以 `u_<id>` 連線，資料可見性由表權限與 RLS 決定，收回 CONNECT 沒有安全效益，還會影響既有應用
+- 每個連線的管理帳號是該 DB 的 owner，也可能是 superuser；拿掉 `owner_role` 與 `SET ROLE`，所有 op 直接以它執行。權限不足時 op 失敗並回報，不自動補
+- gateway 不自動對目標 DB 做 migrate：`gateway_acl` 物件、`gw_managed`、`paradedb` 授權都由操作者照 `docs/target-db-setup.md` 手動執行；gateway 只做唯讀檢查（`targetdb.check`），在註冊連線與啟動時回報缺項
+- 執行期的權限操作（建群組 role、GRANT/REVOKE、membership、宣告列級受控時 `ENABLE RLS` / `CREATE POLICY`）仍由 gateway 自動執行，這是權限模型本身
+- RLS 函式用 `pg_has_role(..., 'USAGE')` 並 join `pg_roles`：管理帳號以 CREATEROLE 建立 role 時得到的隱含 membership 不繼承權限，不會被當成受控使用者；`row_grants` 裡的孤兒資料（role 已不存在）會被忽略，不會讓查詢報錯
+- 群組與成員是全域的，同一個 cluster 上的多個連線共用 `g_*`、`u_*`，行為一致；群組底下還有規則時不可刪除
+- 重放時角色或物件不存在的 op 略過並記錄（規則見 `permissions/types.py`）；`DropGroupRole` 先刪該群組的 `row_grants` 再刪 role
