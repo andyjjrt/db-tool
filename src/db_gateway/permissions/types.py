@@ -83,7 +83,9 @@ class DropGroupRole(PgOp):
 
 @dataclass(frozen=True, slots=True)
 class GrantMembership(PgOp):
-    """GRANT <group> TO <member>.
+    """GRANT <group> TO <member> WITH INHERIT TRUE.
+
+    Granting again repairs a membership granted earlier with INHERIT FALSE.
 
     The executor skips it when either role does not exist (a personal role is
     created at the user's first session, which then applies its memberships).

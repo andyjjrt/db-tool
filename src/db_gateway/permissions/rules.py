@@ -8,7 +8,9 @@ only one of them may pass. The lock is per instance; the application builds exac
 
 Each mutating method writes exactly one ``audit_log`` row of kind ``admin`` when it
 completes (including a PG step that failed after the SQLite/OpenFGA part was done); a
-call rejected by a check writes nothing. The ``detail`` JSON carries the action, its
+call rejected by a check writes nothing. Group deletion records its admin write
+before inline work; any subsequent DROP ROLE failures get a separate ``sync`` row
+because the audit log is append-only. The ``detail`` JSON carries the action, its
 arguments, the tuples written and deleted and, on a PG failure, ``error``.
 
 Row control is declared in OpenFGA, which is its single source of truth: one
@@ -41,6 +43,7 @@ from db_gateway.permissions.admin import (
     ensure_can_add_admin,
     ensure_can_remove_admin,
 )
+from db_gateway.permissions.context import ConnectionLocks
 from db_gateway.permissions.executor_protocol import Executor
 from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStore, Tuple
 from db_gateway.permissions.types import (
@@ -80,6 +83,10 @@ class PartitionStats(Protocol):
         ...
 
 
+class InlineRevoker(Protocol):
+    async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool: ...
+
+
 def _no_wildcard(what: str, value: str) -> None:
     if value == ALL:
         raise ValueError(f"'*' is not a legal {what}")
@@ -99,6 +106,9 @@ class RuleService:
         *,
         distinct_limit: int = 200,
         initial_admins: Set[str] = INITIAL_ADMINS,
+        inline: InlineRevoker | None = None,
+        revoke_timeout_s: float = 5.0,
+        locks: ConnectionLocks | None = None,
     ) -> None:
         self._db = db
         self._store = store
@@ -106,7 +116,10 @@ class RuleService:
         self._stats = partition_stats
         self._distinct_limit = distinct_limit
         self._initial_admins = initial_admins
+        self._inline = inline
+        self._revoke_timeout = revoke_timeout_s
         self._lock = asyncio.Lock()
+        self._locks = locks if locks is not None else ConnectionLocks()
 
     # --- lookups -------------------------------------------------------------------
 
@@ -161,6 +174,13 @@ class RuleService:
         )
 
     # --- writes --------------------------------------------------------------------
+
+    async def _inline_revoke(self, deleted: Sequence[Tuple]) -> str:
+        if self._inline is not None and await self._inline.apply_inline(
+            deleted, self._revoke_timeout
+        ):
+            return "synced"
+        return "pending"
 
     async def _write(self, writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
         """Write to OpenFGA, batching deletes beyond one request's tuple limit."""
@@ -227,7 +247,8 @@ class RuleService:
         failed: dict[str, str] = {}
         for connection in connections:
             try:
-                await self._executor.apply(connection, [op])
+                async with self._locks(connection):
+                    await self._executor.apply(connection, [op])
             except Exception as exc:
                 failed[connection] = f"{type(exc).__name__}: {exc}"
         return failed
@@ -276,21 +297,33 @@ class RuleService:
             await self._write(deletes=members)
             async with metadata.transaction(self._db):
                 await self._db.execute("DELETE FROM groups WHERE name = ?", (name,))
+                await self._audit(actor, "delete_group", {"name": name}, None, deleted=members)
+            await self._inline_revoke(members)
             failed = await self._apply_everywhere(
                 list(await self._connections()), DropGroupRole(group_role(name))
             )
-            await self._record(
-                actor, "delete_group", {"name": name}, deleted=members, failed=failed
-            )
+            if failed:
+                async with metadata.transaction(self._db):
+                    await audit.record(
+                        self._db,
+                        "sync",
+                        user_id=actor.id,
+                        error="; ".join(f"{name}: {error}" for name, error in failed.items()),
+                        detail={
+                            "action": "delete_group",
+                            "name": name,
+                            "failed_connections": failed,
+                        },
+                    )
             return failed
 
     async def add_member(self, actor: AdminUser, group: str, user_id: int) -> None:
         await self._member(actor, "add_member", group, user_id)
 
-    async def remove_member(self, actor: AdminUser, group: str, user_id: int) -> None:
-        await self._member(actor, "remove_member", group, user_id)
+    async def remove_member(self, actor: AdminUser, group: str, user_id: int) -> str:
+        return await self._member(actor, "remove_member", group, user_id)
 
-    async def _member(self, actor: AdminUser, action: str, group: str, user_id: int) -> None:
+    async def _member(self, actor: AdminUser, action: str, group: str, user_id: int) -> str:
         async with self._lock:
             await self._require_group(group)
             await self._user(user_id)
@@ -305,6 +338,7 @@ class RuleService:
                 written=written,
                 deleted=deleted,
             )
+            return "synced" if adding else await self._inline_revoke(deleted)
 
     # --- schema and table readers ----------------------------------------------------
 
@@ -335,7 +369,7 @@ class RuleService:
 
     async def revoke_schema_reader(
         self, actor: AdminUser, group: str, connection: str, schema: str
-    ) -> None:
+    ) -> str:
         _no_wildcard("schema name", schema)
         async with self._lock:
             await self._require_group(group)
@@ -349,6 +383,7 @@ class RuleService:
                 connection_id=connection_id,
                 deleted=[rule],
             )
+            return await self._inline_revoke([rule])
 
     async def grant_table_reader(
         self, actor: AdminUser, group: str, connection: str, schema: str, table: str
@@ -378,7 +413,7 @@ class RuleService:
 
     async def revoke_table_reader(
         self, actor: AdminUser, group: str, connection: str, schema: str, table: str
-    ) -> None:
+    ) -> str:
         _no_wildcard("schema name", schema)
         _no_wildcard("table name", table)
         async with self._lock:
@@ -393,6 +428,7 @@ class RuleService:
                 connection_id=connection_id,
                 deleted=[rule],
             )
+            return await self._inline_revoke([rule])
 
     # --- row sets --------------------------------------------------------------------
 
@@ -417,8 +453,8 @@ class RuleService:
         table: str,
         column: str,
         value: str,
-    ) -> None:
-        await self._row_set(
+    ) -> str:
+        return await self._row_set(
             actor, "revoke_row_set", group, connection, schema, table, column, value
         )
 
@@ -432,7 +468,7 @@ class RuleService:
         table: str,
         column: str,
         value: str,
-    ) -> None:
+    ) -> str:
         _no_wildcard("schema name", schema)
         _no_wildcard("table name", table)
         _no_wildcard("row_set column", column)
@@ -480,6 +516,7 @@ class RuleService:
                 written=written,
                 deleted=deleted,
             )
+            return await self._inline_revoke(deleted) if action == "revoke_row_set" else "synced"
 
     # --- row-control declarations ------------------------------------------------------
 

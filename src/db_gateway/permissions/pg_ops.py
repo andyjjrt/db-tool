@@ -64,7 +64,13 @@ def render(op: PgOp) -> list[Composable]:
                 sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)),
             ]
         case GrantMembership(group=group, member=member):
-            return [sql.SQL("GRANT {} TO {}").format(sql.Identifier(group), sql.Identifier(member))]
+            # Explicit INHERIT TRUE: re-granting also repairs a membership whose
+            # inherit option was turned off (PG16+ keeps per-grant options).
+            return [
+                sql.SQL("GRANT {} TO {} WITH INHERIT TRUE").format(
+                    sql.Identifier(group), sql.Identifier(member)
+                )
+            ]
         case RevokeMembership(group=group, member=member):
             return [
                 sql.SQL("REVOKE {} FROM {}").format(sql.Identifier(group), sql.Identifier(member))

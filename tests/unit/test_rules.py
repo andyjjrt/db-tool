@@ -3,7 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 import pytest
@@ -11,6 +11,7 @@ import pytest
 from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.admin import AdminForbidden, AdminUser, admin_tuple
+from db_gateway.permissions.context import ConnectionLocks
 from db_gateway.permissions.rules import NotFound, RuleConflict, RuleService
 from db_gateway.permissions.store import PermissionStoreUnavailable, Tuple
 from db_gateway.permissions.store_memory import MemoryStore
@@ -633,3 +634,208 @@ async def test_concurrent_schema_and_table_grants_allow_exactly_one(
     assert sum(r is None for r in results) == 1
     readers = [t for t in await store.read() if t.relation == "reader"]
     assert len(readers) == 1
+
+
+@pytest.mark.parametrize("inline_result", [None, False, True])
+@pytest.mark.parametrize("kind", ["member", "schema", "table", "row_set"])
+async def test_revoke_returns_inline_status_after_store_write_under_global_lock(
+    db: aiosqlite.Connection,
+    store: MemoryStore,
+    executor: FakeExecutor,
+    stats: FakeStats,
+    inline_result: bool | None,
+    kind: str,
+) -> None:
+    calls: list[tuple[list[Tuple], float]] = []
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            assert service._lock.locked()
+            remaining = await store.read()
+            assert all(item not in remaining for item in deletes)
+            calls.append((list(deletes), timeout_s))
+            return bool(inline_result)
+
+    service = RuleService(
+        db,
+        store,
+        executor,
+        stats,
+        inline=None if inline_result is None else Inline(),
+        revoke_timeout_s=1.25,
+    )
+    await make_group(service)
+    if kind == "member":
+        await service.add_member(INITIAL, "g1", 4)
+        result = await service.remove_member(INITIAL, "g1", 4)
+        deleted = [Tuple(ids.user(4), "member", ids.group("g1"))]
+    elif kind == "schema":
+        await service.grant_schema_reader(INITIAL, "g1", "prod", "public")
+        result = await service.revoke_schema_reader(INITIAL, "g1", "prod", "public")
+        deleted = [Tuple(ids.group_member("g1"), "reader", ids.db_schema("prod", "public"))]
+    elif kind == "table":
+        await service.grant_table_reader(INITIAL, "g1", "prod", "public", "t")
+        result = await service.revoke_table_reader(INITIAL, "g1", "prod", "public", "t")
+        deleted = [Tuple(ids.group_member("g1"), "reader", ids.db_table("prod", "public", "t"))]
+    else:
+        await service.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+        await service.grant_row_set(INITIAL, "g1", "prod", "public", "t", "team", "a")
+        result = await service.revoke_row_set(INITIAL, "g1", "prod", "public", "t", "team", "a")
+        set_id = ids.row_set("prod", "public", "t", "team", "a")
+        deleted = [
+            Tuple(ids.group_member("g1"), "reader", set_id),
+            Tuple(ids.db_table("prod", "public", "t"), "table", set_id),
+        ]
+    assert result == ("synced" if inline_result else "pending")
+    assert calls == ([] if inline_result is None else [(deleted, 1.25)])
+    assert (await audit_rows(db))[-1]["detail"]["deleted"] == [
+        {"user": item.user, "relation": item.relation, "object": item.object} for item in deleted
+    ]
+
+
+async def test_delete_group_revokes_members_inline_and_preserves_failure_dictionary(
+    db: aiosqlite.Connection, store: MemoryStore, executor: FakeExecutor, stats: FakeStats
+) -> None:
+    calls: list[list[Tuple]] = []
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            assert service._lock.locked()
+            assert await store.read(ids.group("g1"), "member") == []
+            calls.append(list(deletes))
+            return True
+
+    service = RuleService(db, store, executor, stats, inline=Inline())
+    await make_group(service)
+    await service.add_member(INITIAL, "g1", 4)
+    executor.fail_on.add("dev")
+    failed = await service.delete_group(INITIAL, "g1")
+    assert list(failed) == ["dev"]
+    assert calls == [[Tuple(ids.user(4), "member", ids.group("g1"))]]
+    rows = await audit_rows(db)
+    deletion = [row for row in rows if row["detail"]["action"] == "delete_group"]
+    assert [row["kind"] for row in deletion] == ["admin", "sync"]
+    assert deletion[0]["detail"]["deleted"] == [
+        {"user": ids.user(4), "relation": "member", "object": ids.group("g1")}
+    ]
+    assert deletion[1]["detail"]["failed_connections"] == failed
+
+
+async def test_inline_not_called_when_store_delete_fails(
+    db: aiosqlite.Connection, executor: FakeExecutor, stats: FakeStats
+) -> None:
+    class Store(MemoryStore):
+        async def write(self, writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
+            if deletes:
+                raise PermissionStoreUnavailable("offline")
+            await super().write(writes, deletes)
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            pytest.fail("inline revoke ran before a successful store write")
+
+    service = RuleService(db, Store(), executor, stats, inline=Inline())
+    await make_group(service)
+    with pytest.raises(PermissionStoreUnavailable):
+        await service.remove_member(INITIAL, "g1", 4)
+
+
+@pytest.mark.parametrize("kind", ["member", "schema", "table", "row_set", "group"])
+async def test_admin_audit_survives_cancellation_during_inline_revoke(
+    db: aiosqlite.Connection,
+    store: MemoryStore,
+    executor: FakeExecutor,
+    stats: FakeStats,
+    kind: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            entered.set()
+            await release.wait()
+            return True
+
+    service = RuleService(db, store, executor, stats, inline=Inline())
+    await make_group(service)
+    if kind in {"member", "group"}:
+        await service.add_member(INITIAL, "g1", 4)
+        call = (
+            service.remove_member(INITIAL, "g1", 4)
+            if kind == "member"
+            else service.delete_group(INITIAL, "g1")
+        )
+        action = "remove_member" if kind == "member" else "delete_group"
+    elif kind == "schema":
+        await service.grant_schema_reader(INITIAL, "g1", "prod", "public")
+        call = service.revoke_schema_reader(INITIAL, "g1", "prod", "public")
+        action = "revoke_schema_reader"
+    elif kind == "table":
+        await service.grant_table_reader(INITIAL, "g1", "prod", "public", "t")
+        call = service.revoke_table_reader(INITIAL, "g1", "prod", "public", "t")
+        action = "revoke_table_reader"
+    else:
+        await service.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+        await service.grant_row_set(INITIAL, "g1", "prod", "public", "t", "team", "a")
+        call = service.revoke_row_set(INITIAL, "g1", "prod", "public", "t", "team", "a")
+        action = "revoke_row_set"
+    task = asyncio.create_task(call)
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    rows = await audit_rows(db)
+    assert rows[-1]["kind"] == "admin"
+    assert rows[-1]["detail"]["action"] == action
+    assert rows[-1]["detail"]["deleted"]
+    for item in rows[-1]["detail"]["deleted"]:
+        assert Tuple(**item) not in await store.read(item["object"])
+    if kind == "group":
+        # The group row goes with the audit row, before the inline wait.
+        assert await count(db, "groups") == 0
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("dropping", [False, True])
+async def test_group_role_apply_holds_global_then_connection_lock(
+    db: aiosqlite.Connection,
+    store: MemoryStore,
+    executor: FakeExecutor,
+    stats: FakeStats,
+    monkeypatch: pytest.MonkeyPatch,
+    shared: bool,
+    dropping: bool,
+) -> None:
+    queued = asyncio.Event()
+    locks = ConnectionLocks()
+    service = RuleService(db, store, executor, stats, locks=locks if shared else None)
+    if not shared:
+        locks = service._locks
+    if dropping:
+        await make_group(service)
+    executor.calls.clear()
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self) -> Literal[True]:
+            if self.locked():
+                queued.set()
+            return await super().acquire()
+
+    locks._locks["prod"] = ObservedLock()
+    apply = executor.apply
+
+    async def observe(connection: str, ops: Sequence[PgOp]) -> Sequence[PgOp]:
+        assert service._lock.locked()
+        assert locks(connection).locked()
+        return await apply(connection, ops)
+
+    monkeypatch.setattr(executor, "apply", observe)
+    async with locks("prod"):
+        task = asyncio.create_task(
+            service.delete_group(INITIAL, "g1") if dropping else service.create_group(INITIAL, "g1")
+        )
+        await asyncio.wait_for(queued.wait(), 2)
+        assert executor.calls == []
+    assert await asyncio.wait_for(task, 2) == {}
+    assert [name for name, _ in executor.calls] == ["prod", "dev"]

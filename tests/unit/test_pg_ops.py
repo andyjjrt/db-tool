@@ -118,7 +118,7 @@ def test_drop_role_and_membership_render_identifiers() -> None:
         'DELETE FROM "gateway_acl"."row_grants" WHERE "group_role" = \'g"one\'',
         'DROP ROLE IF EXISTS "g""one"',
     ]
-    assert _sql(GrantMembership('g"one', "u_1")) == ['GRANT "g""one" TO "u_1"']
+    assert _sql(GrantMembership('g"one', "u_1")) == ['GRANT "g""one" TO "u_1" WITH INHERIT TRUE']
     assert _sql(RevokeMembership("g", "u")) == ['REVOKE "g" FROM "u"']
     assert required_roles(GrantMembership("g", "u")) == ("g", "u")
     assert required_roles(RevokeMembership("g", "u")) == ("g", "u")

@@ -9,7 +9,11 @@ including unexpected parent roles, with ADMIN/INHERIT/SET flags. Roles lists
 only existing g_* and u_* roles (cluster-wide).
 
 RLS readers include flags for every ordinary/partitioned table in the supplied
-schemas, and definitions of the two gateway policies, including their targets.
+schemas, the definitions of every policy on them (gateway or not), and the types
+of the columns of tables that have RLS enabled or any policy. Policy expressions
+and types are deparsed with search_path pinned to pg_catalog, so any operator,
+function or type outside pg_catalog is printed schema-qualified and cannot pass
+for the built-in one.
 Row grants include ALL gateway_acl.row_grants rows, even orphans and rows outside
 the supplied schemas, so the Reconciler can detect and delete stale entries.
 All returned records are immutable and contain names rather than catalog OIDs.
@@ -32,6 +36,9 @@ DefaultSelect = tuple[str, str, str]  # owner, schema, grantee
 Membership = tuple[str, str, str, bool, bool, bool]  # group, member, grantor, admin, inherit, set
 RowSecurity = tuple[str, str, bool, bool]  # schema, table, enabled, forced
 RowGrant = tuple[str, str, str, str, str]  # group, schema, table, column, value
+ColumnType = tuple[str, str, str, str]  # schema, table, column, format_type()
+
+_PIN_SEARCH_PATH = SQL("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +63,7 @@ class ActualState:
     row_security: frozenset[RowSecurity]
     policies: frozenset[RowPolicy]
     row_grants: frozenset[RowGrant]
+    column_types: frozenset[ColumnType] = frozenset()
 
 
 async def read_table_select(
@@ -153,6 +161,8 @@ async def read_row_security(
 async def read_policies(
     conn: psycopg.AsyncConnection, schemas: Sequence[str]
 ) -> frozenset[RowPolicy]:
+    """Every policy on tables in the schemas; pins search_path for this transaction."""
+    await conn.execute(_PIN_SEARCH_PATH)
     cursor = await conn.execute(
         SQL(
             "SELECT n.nspname, c.relname, p.polname, p.polcmd, p.polpermissive, "
@@ -164,8 +174,7 @@ async def read_policies(
             "FROM pg_catalog.pg_policy p "
             "JOIN pg_catalog.pg_class c ON c.oid = p.polrelid "
             "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = ANY({}::text[]) "
-            "AND p.polname IN ('gw_passthrough', 'gw_read')"
+            "WHERE n.nspname = ANY({}::text[])"
         ).format(Literal(list(schemas)))
     )
     rows = await cursor.fetchall()
@@ -173,6 +182,27 @@ async def read_policies(
         RowPolicy(schema, table, name, command, permissive, tuple(roles), using, with_check)
         for schema, table, name, command, permissive, roles, using, with_check in rows
     )
+
+
+async def read_column_types(
+    conn: psycopg.AsyncConnection, schemas: Sequence[str]
+) -> frozenset[ColumnType]:
+    """Column types of tables with RLS enabled or any policy; pins search_path."""
+    await conn.execute(_PIN_SEARCH_PATH)
+    cursor = await conn.execute(
+        SQL(
+            "SELECT n.nspname, c.relname, a.attname, "
+            "pg_catalog.format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_catalog.pg_attribute a "
+            "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = ANY({}::text[]) AND c.relkind IN ('r', 'p') "
+            "AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND (c.relrowsecurity OR EXISTS "
+            "(SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid))"
+        ).format(Literal(list(schemas)))
+    )
+    return frozenset(await cursor.fetchall())
 
 
 async def read_row_grants(conn: psycopg.AsyncConnection) -> frozenset[RowGrant]:
@@ -209,4 +239,5 @@ async def read_actual(
             row_security=await read_row_security(conn, schemas),
             policies=await read_policies(conn, schemas),
             row_grants=await read_row_grants(conn),
+            column_types=await read_column_types(conn, schemas),
         )
