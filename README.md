@@ -8,7 +8,7 @@
 - 收回權限時在 5 秒內生效；Syncer 持續同步，Reconciler 定期修正被手動改掉的權限。
 - gateway 不會自動修改目標 DB 的結構，也不會提權；目標 DB 的一次性設定由操作者手動執行。
 
-> 目前狀態：權限模型與管理 API 已完成；登入（M1）尚未實作，管理 API 目前對所有請求回 401。
+> 目前狀態：權限模型、管理 API 與 OIDC 登入已完成；M1 的開通、個人 role 啟用與 reaper 尚未實作。
 
 ## 快速開始（開發環境）
 
@@ -23,7 +23,9 @@ uv run ruff check . && uv run pyright
 
 ```sh
 export DBGW_OPENFGA_STORE_ID=<store id>   # 先在 OpenFGA 建立 store，見 docs/usage.md
-uv run uvicorn db_gateway.app:create_app --factory
+export DBGW_OIDC_ISSUER=... DBGW_OIDC_CLIENT_ID=... DBGW_OIDC_REDIRECT_URI=http://localhost:8000/auth/callback
+export DBGW_COOKIE_SECURE=false           # 本機 http
+uv run uvicorn db_gateway.app:create_app --factory --log-config src/db_gateway/logging_config.json
 ```
 
 ## 文件
@@ -40,7 +42,8 @@ uv run uvicorn db_gateway.app:create_app --factory
 ```
 src/db_gateway/
   app.py              FastAPI app 與 lifespan（啟動 Syncer、Reconciler）
-  api/                管理 API 與身分檢查
+  api/                管理 API、登入路由與身分檢查
+  auth/               OIDC client、登入 state、登入 session
   permissions/        OpenFGA store、映射、RuleService、Syncer、Reconciler、掃描器
   provisioner/        個人 role 與 session 開始時的 membership 補齊
   targetdb/           目標 DB 設定 SQL 與唯讀檢查

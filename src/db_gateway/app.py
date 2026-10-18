@@ -2,13 +2,18 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
+import httpx
 import psycopg
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg.sql import SQL, Identifier, Literal
 
+from db_gateway.api import admin_users, auth_routes
 from db_gateway.api.admin_permissions import router, validate_connection
+from db_gateway.auth.oidc import OidcClient
+from db_gateway.logging_config import install_access_log_filter
 from db_gateway.metadata import connect, migrate
 from db_gateway.permissions import admin, scan
 from db_gateway.permissions.admin import AdminForbidden
@@ -89,6 +94,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
     conn = await connect(settings.metadata_db_path)
     store: OpenFgaStore | None = None
+    oidc_client: OidcClient | None = None
     syncer: Syncer | None = None
     reconciler: Reconciler | None = None
     tasks: list[asyncio.Task[None]] = []
@@ -96,6 +102,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         await migrate(conn)
         app.state.metadata = conn
+        app.state.oidc = None
+        if settings.oidc_issuer is not None:
+            oidc_client = OidcClient.from_settings(
+                settings,
+                transport=app.state.oidc_transport,
+                clock=app.state.oidc_clock,
+            )
+            app.state.oidc = oidc_client
         app.state.store = None
         app.state.store_ready = False
         app.state.store_model_lock = asyncio.Lock()
@@ -165,8 +179,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     logger.error("Background task %s failed: %s", task.get_name(), result)
         finally:
             try:
-                if store is not None:
-                    await store.aclose()
+                try:
+                    if oidc_client is not None:
+                        await oidc_client.aclose()
+                finally:
+                    if store is not None:
+                        await store.aclose()
             finally:
                 await conn.close()
 
@@ -211,9 +229,72 @@ async def permission_error(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=code, content=content)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _parse_origin(value: str, *, allow_path: bool) -> tuple[str, str, int] | None:
+    """Normalize an http(s) origin to (scheme, host, effective port); None if malformed.
+
+    ``Origin`` headers never carry a path, userinfo, query or fragment, so those
+    are rejected for an incoming Origin; the configured redirect URI may have a
+    path. Default ports are made explicit so ``https://gw`` and
+    ``https://gw:443`` compare equal. Raw whitespace and control characters are
+    rejected before parsing because ``urlsplit`` silently strips some of them;
+    an explicitly empty port is rejected too.
+    """
+    if any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
+        return None
+    try:
+        parts = urlsplit(value)
+        scheme = parts.scheme.lower()
+        if scheme not in {"http", "https"} or not parts.netloc:
+            return None
+        if parts.username is not None or parts.password is not None:
+            return None
+        netloc = parts.netloc
+        if netloc.startswith("["):
+            _, _, remainder = netloc.partition("]")
+            if remainder == ":":
+                return None
+        elif ":" in netloc and not netloc.rpartition(":")[2]:
+            return None
+        if not allow_path:
+            if parts.query or parts.fragment:
+                return None
+            if parts.path not in ("", "/"):
+                return None
+        host = parts.hostname
+        if not host:
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host.lower(), port
+
+
+def _gateway_origin(redirect_uri: str | None) -> tuple[str, str, int] | None:
+    """The gateway's own origin, derived from the configured redirect URI."""
+    if not redirect_uri:
+        return None
+    return _parse_origin(redirect_uri, allow_path=True)
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    oidc_transport: httpx.AsyncBaseTransport | None = None,
+    oidc_clock: Callable[[], float] | None = None,
+) -> FastAPI:
+    install_access_log_filter()
     app = FastAPI(lifespan=_lifespan)
     app.state.settings = settings if settings is not None else get_settings()
+    app.state.oidc_transport = oidc_transport
+    app.state.oidc_clock = oidc_clock
     for kind in (
         RuleConflict,
         NotFound,
@@ -226,6 +307,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         app.add_exception_handler(kind, permission_error)
     app.include_router(router)
+    app.include_router(admin_users.router)
+    app.include_router(auth_routes.router)
+
+    @app.middleware("http")
+    async def reject_cross_origin_writes(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """SameSite=Lax plus an Origin check for unsafe requests to /api/ and logout."""
+        path = request.url.path
+        if request.method not in _SAFE_METHODS and (
+            path.startswith("/api/") or path == "/auth/logout"
+        ):
+            origin = request.headers.get("origin")
+            if origin is not None:
+                allowed = _gateway_origin(request.app.state.settings.oidc_redirect_uri)
+                parsed = _parse_origin(origin, allow_path=False)
+                if parsed is None or parsed != allowed:
+                    return JSONResponse(
+                        status_code=403, content={"detail": "cross-origin request rejected"}
+                    )
+        return await call_next(request)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
