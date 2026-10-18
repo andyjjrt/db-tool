@@ -1,5 +1,7 @@
 # 實作計畫：權限模型（規格書第 7 節）
 
+> 這是實作過程的計畫與決策紀錄，後面章節（§8 起）的決定會覆蓋前面的內容。目前系統的設計請看 [`../architecture.md`](../architecture.md)，使用方法請看 [`../usage.md`](../usage.md)。
+
 來源：[DB Gateway 規格書 v1 §7 權限模型](https://claude.ai/artifact/YYEmX8H7iMwQi1dawMwXEz#239dedd0-4a8a.mem2fzv4v2g.19942)（rev 129）。
 相關章節：§3 架構、§5 帳號生命週期、§8 稽核、§9 資料模型、§10 API、§13 風險、§14 M3。
 

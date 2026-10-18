@@ -1,39 +1,50 @@
 # DB Gateway
 
-PostgreSQL permission management backed by OpenFGA. Target database setup is manual:
-see [target database setup](docs/target-db-setup.md).
+讓使用者透過瀏覽器以 SQL 查詢 ParadeDB（PostgreSQL 17 + `pg_search`），並以群組管理「誰能讀哪些 schema、表，以及表裡的哪些列」。
 
-## Admin API
+- 權限存在 OpenFGA，是唯一的來源；gateway 把它同步成目標 DB 上的 `GRANT` 與 RLS policy。
+- 每個使用者以自己的 `u_<id>` role 連線，能看到的資料完全由 PostgreSQL 決定。
+- 列級控制：同一張表可以讓不同群組只看到某個欄位特定值的列，可搭配 ParadeDB 的 `@@@` 與 `paradedb.score()`。
+- 收回權限時在 5 秒內生效；Syncer 持續同步，Reconciler 定期修正被手動改掉的權限。
+- gateway 不會自動修改目標 DB 的結構，也不會提權；目標 DB 的一次性設定由操作者手動執行。
 
-Run `uv run uvicorn db_gateway.app:create_app --factory` after configuring
-`DBGW_OPENFGA_STORE_ID`, `DBGW_OPENFGA_API_URL` and `DBGW_METADATA_DB_PATH`.
-The lifespan starts permission sync and startup/periodic reconciliation; an OpenFGA
-outage does not stop the application. Connection credentials use a secret reference,
-resolved as `DBGW_SECRET_<NORMALIZED_REF>` containing libpq `user` / `password` fields.
+> 目前狀態：權限模型與管理 API 已完成；登入（M1）尚未實作，管理 API 目前對所有請求回 401。
 
-`/docs` describes `/api/admin`: groups, descriptions, members, schema/table/row-set
-grants, rule listings, row policies, connection registration, sync, reconcile, drift,
-and admins. `POST /reconcile?dry_run=true` and `GET /drift` only report planned fixes.
-Grant bodies use `group`, `connection`, `schema`, plus `table`, `column`, `value`
-as appropriate. DELETE grant endpoints take the same JSON body.
-Revokes return `200 {"status":"synced"}` or `202 {"status":"pending"}`.
-Conflicts return 409 with conflicting rules; missing resources 404, invalid input or
-target setup 422, forbidden admin operations 403, and an unavailable permission store
-or target database 503. Runtime connection failures include a safe reason
-(`connect failed`, `credentials invalid`, or `secret missing or invalid`).
-Query failures return 503 with the error class and SQLSTATE, without server messages.
-A permission operation the target rejects (for example a missing privilege of the admin
-account) returns 502 with the error class and SQLSTATE; the gateway never escalates.
-Bulk reconcile/drift calls always return 200 with every per-connection report;
-single-connection calls return 503 only for an unavailable target, retaining the
-report and any applied fixes. Other reconcile failures stay in the report.
-Startup target checks run in the background; startup and registration checks use
-a five-second connection timeout. Runtime connections use
-`DBGW_TARGET_CONNECT_TIMEOUT_S` (default 5 seconds).
-`POST /api/admin/connections` is restricted to `INITIAL_ADMINS`, the code-defined
-initial administrators. Ordinary admins receive 403 before credentials are resolved
-or a target connection is attempted.
+## 快速開始（開發環境）
 
-Login awaits M1: `current_user` currently rejects every request with 401
-(`login not implemented, M1`). There is no header or environment authentication bypass.
-Tests supply identities only through FastAPI dependency overrides.
+```sh
+uv sync
+docker compose up -d --wait            # ParadeDB + OpenFGA
+uv run pytest -q                       # unit + integration + acceptance
+uv run ruff check . && uv run pyright
+```
+
+啟動 app：
+
+```sh
+export DBGW_OPENFGA_STORE_ID=<store id>   # 先在 OpenFGA 建立 store，見 docs/usage.md
+uv run uvicorn db_gateway.app:create_app --factory
+```
+
+## 文件
+
+| 文件 | 內容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 系統設計：元件、權限模型、RLS、同步、鎖、失敗時的行為、已知限制 |
+| [docs/usage.md](docs/usage.md) | 使用方法：部署、設定、註冊連線、管理 API 範例、監控與維運 |
+| [docs/target-db-setup.md](docs/target-db-setup.md) | 目標資料庫的一次性設定、管理帳號前置條件、drift 與不安全 view 的處理 |
+| [docs/plans/permission-model.md](docs/plans/permission-model.md) | 實作計畫與各階段的決策紀錄 |
+
+## 專案結構
+
+```
+src/db_gateway/
+  app.py              FastAPI app 與 lifespan（啟動 Syncer、Reconciler）
+  api/                管理 API 與身分檢查
+  permissions/        OpenFGA store、映射、RuleService、Syncer、Reconciler、掃描器
+  provisioner/        個人 role 與 session 開始時的 membership 補齊
+  targetdb/           目標 DB 設定 SQL 與唯讀檢查
+  metadata/           SQLite 連線、migration、稽核
+tests/
+  unit/ integration/ acceptance/
+```

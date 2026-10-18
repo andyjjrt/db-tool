@@ -111,7 +111,7 @@ transaction 中執行，不會變更 DB。
 
 Gateway 建立的 `u_*` 個人 role 使用 `INHERIT`，且 `gw_managed` membership 可繼承；
 不得將 `u_*` 改成 `NOINHERIT` 或把 membership 設為 `INHERIT FALSE`。
-`createrole_self_grant` 必須保持空值；W3 的權限執行器會在建立 role 的 transaction
+`createrole_self_grant` 必須保持空值；權限執行器（`PgExecutor`）會在建立 role 的 transaction
 中暫時執行 `SET LOCAL createrole_self_grant = ''`。checker 會回報可讓管理帳號變成
 managed user 的設定或 membership，包括 admin 已經取得 `USAGE` 或 `SET` 的情形。
 
