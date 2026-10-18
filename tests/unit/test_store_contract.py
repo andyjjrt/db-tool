@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from db_gateway.permissions import ids
 from db_gateway.permissions.store import (
     MAX_TUPLES_PER_WRITE,
     ChangeOp,
@@ -16,6 +17,16 @@ class StoreContract:
     @pytest.fixture
     def store(self) -> PermissionStore:
         raise NotImplementedError
+
+    async def test_group_existence_relation_round_trips(self, store: PermissionStore) -> None:
+        group = ids.group_tuple("analysts")
+        member = Tuple("user:1", "member", group.user)
+        await store.write(writes=[group, member])
+        assert await store.read(ids.GATEWAY_MAIN, "group") == [group]
+        assert await store.check(group.user, "group", ids.GATEWAY_MAIN)
+        await store.write(deletes=[member, group])
+        assert await store.read() == []
+        assert not await store.check(group.user, "group", ids.GATEWAY_MAIN)
 
     async def test_write_and_delete_are_idempotent(self, store: PermissionStore) -> None:
         item = Tuple(

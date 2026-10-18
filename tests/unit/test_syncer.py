@@ -10,12 +10,19 @@ import aiosqlite
 import pytest
 
 from db_gateway import metadata
+from db_gateway.permissions import ids
 from db_gateway.permissions.context import ConnectionLocks
 from db_gateway.permissions.executor import ApplyError, TransientApplyError
 from db_gateway.permissions.store import ChangesPage, PermissionStoreUnavailable, Tuple
 from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.syncer import Syncer
-from db_gateway.permissions.types import GrantMembership, PgOp, RevokeMembership
+from db_gateway.permissions.types import (
+    CreateGroupRole,
+    DropGroupRole,
+    GrantMembership,
+    PgOp,
+    RevokeMembership,
+)
 
 MEMBER = Tuple("user:1", "member", "group:team")
 TABLE = Tuple("group:team#member", "reader", "db_table:prod/public/items")
@@ -110,6 +117,59 @@ async def test_token_advances_only_after_whole_page_succeeds(
     assert state["last_applied_at"] is not None
     assert state["fail_count"] == 0
     assert executor.calls[0] == ("prod", [GrantMembership("g_team", "u_1")])
+
+
+async def test_group_creation_precedes_membership_in_change_stream(
+    syncer: Syncer, store: MemoryStore, executor: FakeExecutor
+) -> None:
+    await store.write([ids.group_tuple("team")])
+    await store.write([MEMBER])
+    await syncer.sync_once("prod")
+    assert executor.calls == [
+        ("prod", [CreateGroupRole("g_team")]),
+        ("prod", [GrantMembership("g_team", "u_1")]),
+    ]
+
+
+async def test_inline_group_drop_dependency_is_pending_and_stream_retries(
+    syncer: Syncer, store: MemoryStore, executor: FakeExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group = ids.group_tuple("team")
+    await store.write([group, MEMBER])
+    await syncer.sync_once("prod")
+    token = (await syncer.status())[0]["continuation_token"]
+    deleted = [MEMBER, group]
+    await store.write(deletes=deleted)
+    executor.calls.clear()
+    apply = executor.apply
+    blocked = True
+
+    async def fail_drop(connection: str, ops: Sequence[PgOp]) -> Sequence[PgOp]:
+        assert syncer._locks(connection).locked()
+        skipped = await apply(connection, ops)
+        if blocked and DropGroupRole("g_team") in ops:
+            raise TransientApplyError(
+                connection, DropGroupRole("g_team"), RuntimeError("dependent objects still exist")
+            )
+        return skipped
+
+    monkeypatch.setattr(executor, "apply", fail_drop)
+    assert await syncer.apply_inline(deleted, 2) is False
+    assert executor.calls == [
+        ("prod", [RevokeMembership("g_team", "u_1")]),
+        ("prod", [DropGroupRole("g_team")]),
+    ]
+    await syncer.sync_once("prod")
+    status = (await syncer.status())[0]
+    assert status["continuation_token"] == token
+    assert status["fail_count"] == 1
+    blocked = False
+    await syncer.sync_once("prod")
+    status = (await syncer.status())[0]
+    assert status["continuation_token"] == "4"
+    assert status["last_error"] is None
+    assert status["fail_count"] == 0
+    assert executor.calls[-1] == ("prod", [DropGroupRole("g_team")])
 
 
 async def test_failure_in_later_page_keeps_last_successful_page_token(

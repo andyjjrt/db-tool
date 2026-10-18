@@ -40,7 +40,7 @@ async def test_migration_idempotence_and_pragmas(conn: aiosqlite.Connection) -> 
             "schema_version",
             "users",
             "activations",
-            "groups",
+            "descriptions",
             "connections",
             "sessions",
             "sync_state",
@@ -126,17 +126,7 @@ async def test_activation_revocation(conn: aiosqlite.Connection) -> None:
         await conn.execute("DELETE FROM activations")
 
 
-@pytest.mark.parametrize("name", ["Upper", "bad-name", "bad name", "1bad", "", "a" * 42, "é"])
-async def test_invalid_group_names(conn: aiosqlite.Connection, name: str) -> None:
-    with pytest.raises(sqlite3.IntegrityError):
-        await conn.execute("INSERT INTO groups (name) VALUES (?)", (name,))
-
-
 async def test_names_immutable(conn: aiosqlite.Connection) -> None:
-    for name in ("a", "valid_123", "a" * 41):
-        await conn.execute("INSERT INTO groups (name) VALUES (?)", (name,))
-    with pytest.raises(sqlite3.IntegrityError):
-        await conn.execute("UPDATE groups SET name = ? WHERE name = ?", ("renamed", "a"))
     await conn.execute(
         "INSERT INTO connections (name, host, dbname, admin_secret_ref) VALUES (?, ?, ?, ?)",
         ("prod", "localhost", "postgres", "prod-admin"),
@@ -230,19 +220,41 @@ async def test_activation_replace_rejected(conn: aiosqlite.Connection, verb: str
         assert await cur.fetchall() == before
 
 
-@pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE"])
-@pytest.mark.parametrize("conflict", ["id", "name"])
-async def test_group_replace_rejected(conn: aiosqlite.Connection, verb: str, conflict: str) -> None:
-    await conn.execute("INSERT INTO groups (id, name) VALUES (?, ?)", (1, "original"))
-    async with conn.execute("SELECT * FROM groups") as cur:
-        before = await cur.fetchall()
-    with pytest.raises(sqlite3.IntegrityError):
+async def test_descriptions_allow_upsert_and_delete(conn: aiosqlite.Connection) -> None:
+    async with transaction(conn):
         await conn.execute(
-            f"{verb} INTO groups (id, name) VALUES (?, ?)",
-            (1, "forged") if conflict == "id" else (2, "original"),
+            "INSERT INTO descriptions (object, description) VALUES (?, ?)",
+            ("group:analysts", "original"),
         )
-    async with conn.execute("SELECT * FROM groups") as cur:
-        assert await cur.fetchall() == before
+        async with conn.execute("SELECT updated_at FROM descriptions") as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert to_iso(datetime.fromisoformat(row[0])) == row[0]
+        await conn.execute(
+            "INSERT INTO descriptions (object, description, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(object) DO UPDATE SET "
+            "description = excluded.description, updated_at = excluded.updated_at",
+            ("group:analysts", "changed", "2026-10-18T12:34:56.000Z"),
+        )
+        async with conn.execute("SELECT * FROM descriptions") as cur:
+            assert await cur.fetchall() == [
+                ("group:analysts", "changed", "2026-10-18T12:34:56.000Z")
+            ]
+        await conn.execute("DELETE FROM descriptions WHERE object = ?", ("group:analysts",))
+    async with conn.execute("SELECT * FROM descriptions") as cur:
+        assert await cur.fetchall() == []
+
+
+@pytest.mark.parametrize("object_id, description", [(None, "text"), ("group:a", None)])
+async def test_descriptions_require_object_and_text(
+    conn: aiosqlite.Connection, object_id: str | None, description: str | None
+) -> None:
+    async with transaction(conn):
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+            await conn.execute(
+                "INSERT INTO descriptions (object, description) VALUES (?, ?)",
+                (object_id, description),
+            )
 
 
 @pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE"])
@@ -326,7 +338,7 @@ async def test_all_timestamp_columns_reject_noncanonical_values(
             {"user_id": 1, "reason": "support", "expires_at": valid},
             ("activated_at", "expires_at", "revoked_at"),
         ),
-        ("groups", {"name": "analysts"}, ("created_at",)),
+        ("descriptions", {"object": "group:analysts", "description": "text"}, ("updated_at",)),
         (
             "sessions",
             {"user_id": 1, "activation_id": 1, "connection_id": 1, "valid_until": valid},

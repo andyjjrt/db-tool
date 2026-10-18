@@ -21,7 +21,7 @@ from db_gateway.permissions.store import (
     PermissionStoreUnavailable,
     Tuple,
 )
-from db_gateway.permissions.types import PgOp, RevokeMembership
+from db_gateway.permissions.types import DropGroupRole, PgOp, RevokeMembership
 
 logger = logging.getLogger(__name__)
 
@@ -322,8 +322,13 @@ class Syncer:
                             # fresh state cannot be checked.
                             await self._error(connection, exc, source="inline")
                         ops.extend(revoked)
-                    if ops:
-                        await self._executor.apply(connection, ops)
+                    revokes = [op for op in ops if not isinstance(op, DropGroupRole)]
+                    drops = [op for op in ops if isinstance(op, DropGroupRole)]
+                    if revokes:
+                        await self._executor.apply(connection, revokes)
+                    if drops:
+                        # A dependent role must not roll back fast membership revocation.
+                        await self._executor.apply(connection, drops)
                 return True
             except Exception as exc:
                 await self._error(connection, exc, source="inline")

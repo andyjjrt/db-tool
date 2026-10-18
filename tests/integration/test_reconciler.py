@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import LiteralString
 
@@ -17,11 +17,12 @@ from psycopg.sql import SQL, Composable, Identifier, Literal
 from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.context import ConnectionLocks
-from db_gateway.permissions.executor import PgExecutor
+from db_gateway.permissions.executor import ApplyError, PgExecutor
 from db_gateway.permissions.mapping import grant_ops, revoke_ops
-from db_gateway.permissions.reconciler import Drift, Reconciler, ReconcileReport
+from db_gateway.permissions.reconciler import Drift, ReconcileFailed, Reconciler, ReconcileReport
 from db_gateway.permissions.store import Tuple
 from db_gateway.permissions.store_memory import MemoryStore
+from db_gateway.permissions.syncer import Syncer
 from db_gateway.permissions.types import (
     CreateGroupRole,
     DeleteRowGrant,
@@ -29,6 +30,9 @@ from db_gateway.permissions.types import (
     EnableRowPolicy,
     GrantMembership,
     MappingContext,
+    PgOp,
+    RevokeDefaultSelect,
+    RevokeMembership,
     RevokeTableSelect,
     user_role,
 )
@@ -48,7 +52,7 @@ class World:
     reconciler: Reconciler
     connect: Callable[[str], Awaitable[psycopg.AsyncConnection]]
     connect_as: Callable[[RoleInfo], Awaitable[psycopg.AsyncConnection]]
-    group: str  # SQLite group name
+    group: str  # OpenFGA group name
     user_id: int
     user: RoleInfo
 
@@ -141,9 +145,9 @@ async def world(
                     "default_privilege_owners) VALUES (?, 'h', 'd', 'ref', ?)",
                     (name, json.dumps([target_admin.login.name])),
                 )
-            await db.execute("INSERT INTO groups (name) VALUES (?)", (group,))
         executor = PgExecutor(connect)
         store = MemoryStore()
+        await store.write([ids.group_tuple(group)])
         reconciler = Reconciler(db, store, executor, connect, ConnectionLocks())
         await executor.apply("target", [CreateGroupRole(f"g_{group}")])
         user_id = secrets.randbits(48)
@@ -191,8 +195,7 @@ async def test_applied_tuples_reconcile_to_nothing(world: World) -> None:
 
 async def test_row_set_state_reconciles_to_nothing(world: World) -> None:
     other = f"{world.group[:30]}_two"
-    async with metadata.transaction(world.db):
-        await world.db.execute("INSERT INTO groups (name) VALUES (?)", (other,))
+    await world.store.write([ids.group_tuple(other)])
     await world.executor.apply("target", [CreateGroupRole(f"g_{other}")])
     second = Tuple(
         ids.group_member(other),
@@ -440,6 +443,167 @@ async def test_missing_group_role_is_recreated(world: World) -> None:
     assert report.fixes[0] == CreateGroupRole(world.role)
     assert GrantMembership(world.role, world.user.name) in report.fixes
     assert (await settled(world)).fixes == []
+
+
+async def test_orphan_group_with_grants_and_member_is_dropped_after_revokes(world: World) -> None:
+    schema = world.admin.schema
+    reader = Tuple(ids.group_member(world.group), "reader", ids.db_schema("target", schema))
+    await world.converge(world.member, reader)
+    assert await world.user_teams() == ["a", "b", "c"]
+    await world.store.write(deletes=[world.member, reader, ids.group_tuple(world.group)])
+    expected = {
+        RevokeMembership(world.role, world.user.name),
+        RevokeTableSelect(schema, "items", world.role),
+        RevokeTableSelect(schema, "other", world.role),
+        RevokeDefaultSelect(world.admin.login.name, schema, world.role),
+        DeleteRowGrant(world.role, schema, "*", "*"),
+        DropGroupRole(world.role),
+    }
+    dry = await world.reconciler.reconcile("target", dry_run=True)
+    assert set(dry.fixes) == expected
+    assert dry.reported == []
+    assert await world.user_teams() == ["a", "b", "c"]
+    assert await world.admin_sql(
+        "SELECT 1 FROM pg_roles WHERE rolname = {}", Literal(world.role)
+    ) == [(1,)]
+    assert await world.audit_rows() == []
+    report = await settled(world)
+    assert report.failed == []
+    assert set(report.fixes) == expected
+    assert report.fixes[-1] == DropGroupRole(world.role)
+    assert (
+        await world.admin_sql("SELECT 1 FROM pg_roles WHERE rolname = {}", Literal(world.role))
+        == []
+    )
+    assert await world.admin_sql("SELECT 1 FROM gateway_acl.row_grants") == []
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        await world.user_teams()
+    assert (await settled(world)).fixes == []
+    assert len(await world.audit_rows()) == 1
+
+
+@pytest.mark.parametrize("reason", ["privilege", "dependency", "apply"])
+async def test_orphan_drop_classification_controls_strict_reconcile_and_sync_recovery(
+    world: World,
+    superuser_conn: psycopg.AsyncConnection,
+    unique_name: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    blocked = unique_name("g_aaa")
+    removable = unique_name("g_zzz")
+    if reason == "privilege":
+        await superuser_conn.execute(SQL("CREATE ROLE {} NOLOGIN").format(Identifier(blocked)))
+    else:
+        await world.executor.apply("target", [CreateGroupRole(blocked)])
+        if reason == "dependency":
+            await world.admin_sql(
+                "GRANT USAGE ON SCHEMA {} TO {}",
+                Identifier(world.admin.schema),
+                Identifier(blocked),
+            )
+    await world.executor.apply("target", [CreateGroupRole(removable)])
+    apply = world.executor.apply
+    drop_errors: list[ApplyError] = []
+
+    async def observe_apply(connection: str, ops: Sequence[PgOp]) -> tuple[PgOp, ...]:
+        try:
+            if reason == "apply" and DropGroupRole(blocked) in ops:
+                raise ApplyError(connection, DropGroupRole(blocked), RuntimeError("injected error"))
+            return await apply(connection, ops)
+        except ApplyError as exc:
+            drop_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(world.executor, "apply", observe_apply)
+    reported: list[dict[str, str]] = []
+    if reason == "apply":
+        with pytest.raises(ReconcileFailed) as failure:
+            await world.reconciler.reconcile_strict("target")
+        report = failure.value.report
+        assert report.failed == [DropGroupRole(blocked)]
+        assert report.error is not None and "injected error" in report.error
+        assert report.reported == []
+    else:
+        report = await world.reconciler.reconcile_strict("target")
+        assert report.error is None and report.failed == []
+        (drift,) = [d for d in report.reported if d.kind == "undroppable_group_role"]
+        assert blocked in drift.message and str(drop_errors[0].original) in drift.message
+        assert isinstance(drop_errors[0].original, psycopg.Error)
+        sqlstate = "42501" if reason == "privilege" else "2BP01"
+        assert drop_errors[0].original.sqlstate == sqlstate
+        assert sqlstate in drift.message
+        reported = [{"kind": drift.kind, "message": drift.message}]
+    assert report.fixes == [DropGroupRole(removable)]
+    assert len(drop_errors) == 1
+    assert await world.admin_sql(
+        "SELECT rolname FROM pg_roles WHERE rolname IN ({}, {}) ORDER BY 1",
+        Literal(blocked),
+        Literal(removable),
+    ) == [(blocked,)]
+    rows = await world.audit_rows()
+    assert len(rows) == 1
+    assert rows[0][2]["reported"] == reported
+
+    syncer = Syncer(
+        world.db,
+        world.store,
+        world.executor,
+        world.reconciler._locks,
+        fga_store_id="test",
+        poll_interval_s=2,
+        full_reconcile=world.reconciler.reconcile_strict,
+    )
+    await syncer.status()
+    async with metadata.transaction(world.db):
+        await world.db.execute(
+            "UPDATE sync_state SET continuation_token = 'invalid' WHERE consumer = 'pg:target'"
+        )
+    await syncer.sync_once("target")
+    status = next(s for s in await syncer.status() if s["connection"] == "target")
+    if reason == "apply":
+        assert status["continuation_token"] == "invalid"
+        assert status["fail_count"] == 1
+        assert "injected error" in (status["last_error"] or "")
+        monkeypatch.setattr(world.executor, "apply", apply)
+        await syncer.sync_once("target")
+        status = next(s for s in await syncer.status() if s["connection"] == "target")
+    assert status["last_error"] is None and status["fail_count"] == 0
+    assert status["continuation_token"] not in {None, "invalid"}
+    await world.store.write([world.member])
+    await syncer.sync_once("target")
+    status = next(s for s in await syncer.status() if s["connection"] == "target")
+    assert status["last_error"] is None
+    assert await world.admin_sql(
+        "SELECT 1 FROM pg_auth_members WHERE roleid = {}::regrole AND member = {}::regrole",
+        Literal(world.role),
+        Literal(world.user.name),
+    ) == [(1,)]
+
+
+async def test_dropping_orphan_removes_memberships_from_foreign_grantors(
+    world: World, superuser_conn: psycopg.AsyncConnection
+) -> None:
+    await superuser_conn.execute(
+        SQL("GRANT {} TO {}").format(Identifier(world.role), Identifier(world.user.name))
+    )
+    await world.store.write(deletes=[ids.group_tuple(world.group)])
+    report = await world.reconciler.reconcile_strict("target")
+    assert report.fixes == [DropGroupRole(world.role)]
+    assert report.failed == []
+    assert kinds(report.reported) == ["membership_grantor"]
+    assert (
+        await world.admin_sql("SELECT 1 FROM pg_roles WHERE rolname = {}", Literal(world.role))
+        == []
+    )
+    assert (
+        await world.admin_sql(
+            "SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid "
+            "WHERE g.rolname = {}",
+            Literal(world.role),
+        )
+        == []
+    )
 
 
 async def test_orphan_row_grant_is_deleted(world: World) -> None:

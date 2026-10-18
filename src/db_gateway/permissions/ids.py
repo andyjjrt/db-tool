@@ -9,6 +9,8 @@ every resource has exactly one id.
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
+from db_gateway.permissions.store import Tuple
+
 # OpenFGA rejects object ids longer than this (type prefix included).
 MAX_OBJECT_LEN = 256
 
@@ -48,6 +50,11 @@ def group(name: str) -> str:
 def group_member(name: str) -> str:
     """The userset form used as the user side of rule tuples."""
     return f"{group(name)}#member"
+
+
+def group_tuple(name: str) -> Tuple:
+    """The gateway relation that determines whether a group exists."""
+    return Tuple(group(name), "group", GATEWAY_MAIN)
 
 
 def column(name: str) -> str:

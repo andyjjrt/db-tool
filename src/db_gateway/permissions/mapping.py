@@ -4,8 +4,10 @@ from db_gateway.permissions import ids
 from db_gateway.permissions.store import Tuple
 from db_gateway.permissions.types import (
     ALL,
+    CreateGroupRole,
     DeleteRowGrant,
     DisableRowPolicy,
+    DropGroupRole,
     EnableRowPolicy,
     GrantAllTablesSelect,
     GrantDefaultSelect,
@@ -37,6 +39,8 @@ def _check_connection(connection: str, ctx: MappingContext) -> None:
 
 def _inverse(op: PgOp) -> PgOp:
     match op:
+        case CreateGroupRole(role=role):
+            return DropGroupRole(role)
         case GrantMembership(group=group, member=member):
             return RevokeMembership(group, member)
         case GrantAllTablesSelect(schema=schema, role=role):
@@ -56,6 +60,12 @@ def _inverse(op: PgOp) -> PgOp:
 def grant_ops(t: Tuple, ctx: MappingContext) -> list[TargetedOp]:
     """Return the fixed operations represented by one permission tuple."""
     object_type = t.object.partition(":")[0]
+
+    if t.object == ids.GATEWAY_MAIN and t.relation == "group":
+        if "#" in t.user:
+            raise ValueError(f"expected a bare group object: {t.user}")
+        role = group_role(ids.parse_group(t.user))
+        return [TargetedOp(connection, CreateGroupRole(role)) for connection in ctx.connections]
 
     if object_type == "group" and t.relation == "member":
         if t.object.endswith("#member"):

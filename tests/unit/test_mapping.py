@@ -7,8 +7,10 @@ from db_gateway.permissions.mapping import grant_ops, revoke_ops
 from db_gateway.permissions.store import Tuple
 from db_gateway.permissions.types import (
     ALL,
+    CreateGroupRole,
     DeleteRowGrant,
     DisableRowPolicy,
+    DropGroupRole,
     EnableRowPolicy,
     GrantAllTablesSelect,
     GrantDefaultSelect,
@@ -50,6 +52,42 @@ def test_group_membership_maps_to_each_connection() -> None:
         TargetedOp("reporting", RevokeMembership(group_role("analysts"), user_role(12))),
         TargetedOp("primary", RevokeMembership(group_role("analysts"), user_role(12))),
     ]
+
+
+def test_group_tuple_maps_role_creation_and_drop_to_each_connection() -> None:
+    tuple_ = ids.group_tuple("analysts")
+    assert tuple_ == Tuple("group:analysts", "group", "gateway:main")
+    ctx = _ctx(connections=("primary", "reporting"))
+    assert grant_ops(tuple_, ctx) == [
+        TargetedOp("primary", CreateGroupRole("g_analysts")),
+        TargetedOp("reporting", CreateGroupRole("g_analysts")),
+    ]
+    assert revoke_ops(tuple_, ctx) == [
+        TargetedOp("reporting", DropGroupRole("g_analysts")),
+        TargetedOp("primary", DropGroupRole("g_analysts")),
+    ]
+    assert grant_ops(tuple_, _ctx(connections=())) == []
+
+
+@pytest.mark.parametrize("mapping", [grant_ops, revoke_ops])
+@pytest.mark.parametrize(
+    "tuple_",
+    [
+        Tuple("group:a", "group", "gateway:other"),
+        Tuple("group:a", "group", "db_table:c/s/t"),
+        Tuple("group:a#member", "group", "gateway:main"),
+        Tuple("group:a#other", "group", "gateway:main"),
+        Tuple("user:1", "group", "gateway:main"),
+        Tuple("group:", "group", "gateway:main"),
+        Tuple("group:a/b", "group", "gateway:main"),
+        Tuple("group:%61", "group", "gateway:main"),
+    ],
+)
+def test_group_tuple_rejects_malformed_variants(
+    mapping: Callable[[Tuple, MappingContext], list[TargetedOp]], tuple_: Tuple
+) -> None:
+    with pytest.raises(ValueError):
+        mapping(tuple_, _ctx())
 
 
 def test_schema_reader_maps_defaults_for_every_owner() -> None:

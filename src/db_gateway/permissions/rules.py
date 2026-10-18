@@ -8,8 +8,10 @@ only one of them may pass. The lock is per instance; the application builds exac
 
 Each mutating method writes exactly one ``audit_log`` row of kind ``admin`` when it
 completes (including a PG step that failed after the SQLite/OpenFGA part was done); a
-call rejected by a check writes nothing. Group deletion records its admin write
-before inline work; any subsequent DROP ROLE failures get a separate ``sync`` row
+call rejected by a check writes nothing. Store writes precede the SQLite transaction,
+so a failed SQLite write can leave a permission change without its admin audit row.
+Group deletion records its admin write
+before inline work; inline failures get a separate ``sync`` row from the Syncer
 because the audit log is append-only. The ``detail`` JSON carries the action, its
 arguments, the tuples written and deleted and, on a PG failure, ``error``.
 
@@ -17,7 +19,8 @@ Row control is declared in OpenFGA, which is its single source of truth: one
 ``Tuple(column:<col>, row_column, db_table:<conn>/<schema>/<table>)`` per controlled
 table. A row_set exists iff its parent tuple ``db_table#table -> row_set`` exists;
 ``RuleService`` maintains those parent tuples. Who enabled a table, and when, lives only
-in the audit log.
+in the audit log. Groups exist only through ``gateway:main#group@group:<name>``;
+SQLite descriptions are display-only, and group roles follow the tuple change stream.
 
 Errors: ``RuleConflict`` (409), ``NotFound`` (404), ``AdminForbidden`` (403) and
 ``ValueError`` for invalid input (400).
@@ -26,7 +29,7 @@ Errors: ``RuleConflict`` (409), ``NotFound`` (404), ``AdminForbidden`` (403) and
 import asyncio
 import re
 from collections.abc import Sequence, Set
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 import aiosqlite
@@ -48,16 +51,13 @@ from db_gateway.permissions.executor_protocol import Executor
 from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStore, Tuple
 from db_gateway.permissions.types import (
     ALL,
-    CreateGroupRole,
     DisableRowPolicy,
-    DropGroupRole,
     EnableRowPolicy,
-    PgOp,
-    group_role,
 )
 
 __all__ = [
     "AdminForbidden",
+    "GroupInfo",
     "NotFound",
     "PartitionStats",
     "RuleConflict",
@@ -73,6 +73,12 @@ class RuleConflict(Exception):
 
 class NotFound(Exception):
     """A named group, connection, user or declaration does not exist; the API maps it to 404."""
+
+
+@dataclass(frozen=True, slots=True)
+class GroupInfo:
+    name: str
+    description: str | None
 
 
 class PartitionStats(Protocol):
@@ -123,10 +129,6 @@ class RuleService:
 
     # --- lookups -------------------------------------------------------------------
 
-    async def _connections(self) -> dict[str, int]:
-        async with self._db.execute("SELECT name, id FROM connections ORDER BY id") as cur:
-            return {name: id_ for name, id_ in await cur.fetchall()}
-
     async def _connection_id(self, name: str) -> int:
         async with self._db.execute("SELECT id FROM connections WHERE name = ?", (name,)) as cur:
             row = await cur.fetchone()
@@ -135,9 +137,8 @@ class RuleService:
         return row[0]
 
     async def _require_group(self, name: str) -> None:
-        async with self._db.execute("SELECT 1 FROM groups WHERE name = ?", (name,)) as cur:
-            if await cur.fetchone() is None:
-                raise NotFound(f"group not found: {name}")
+        if not await self._store.read(ids.GATEWAY_MAIN, "group", ids.group(name)):
+            raise NotFound(f"group not found: {name}")
 
     async def _user(self, user_id: int) -> AdminUser:
         async with self._db.execute(
@@ -242,51 +243,88 @@ class RuleService:
             detail=detail,
         )
 
-    async def _apply_everywhere(self, connections: Sequence[str], op: PgOp) -> dict[str, str]:
-        """Run one op on every connection; a failing connection is reported, not raised."""
-        failed: dict[str, str] = {}
-        for connection in connections:
-            try:
-                async with self._locks(connection):
-                    await self._executor.apply(connection, [op])
-            except Exception as exc:
-                failed[connection] = f"{type(exc).__name__}: {exc}"
-        return failed
-
     # --- groups --------------------------------------------------------------------
 
     async def create_group(
         self, actor: AdminUser, name: str, description: str | None = None
-    ) -> dict[str, str]:
-        """Create the group and its ``g_`` role on every connection.
-
-        Returns the connections whose role creation failed (name -> error); the group
-        exists regardless and the Reconciler recreates the missing roles.
-        """
+    ) -> None:
+        """Create the group tuple; the Syncer creates its role on every connection."""
         if not _GROUP_NAME.fullmatch(name):
             raise ValueError(f"invalid group name: {name!r}")
         async with self._lock:
-            async with self._db.execute("SELECT 1 FROM groups WHERE name = ?", (name,)) as cur:
-                if await cur.fetchone() is not None:
-                    raise RuleConflict(f"group already exists: {name}")
+            rule = ids.group_tuple(name)
+            if await self._store.read(rule.object, rule.relation, rule.user):
+                raise RuleConflict(f"group already exists: {name}")
+            await self._write([rule])
             async with metadata.transaction(self._db):
-                await self._db.execute(
-                    "INSERT INTO groups (name, description, created_at) VALUES (?, ?, ?)",
-                    (name, description, metadata.now_iso()),
+                if description is not None:
+                    await self._set_description(rule.user, description)
+                await self._audit(
+                    actor,
+                    "create_group",
+                    {"name": name, "description": description},
+                    None,
+                    written=[rule],
                 )
-            failed = await self._apply_everywhere(
-                list(await self._connections()), CreateGroupRole(group_role(name))
-            )
-            await self._record(
-                actor,
-                "create_group",
-                {"name": name, "description": description},
-                failed=failed,
-            )
-            return failed
 
-    async def delete_group(self, actor: AdminUser, name: str) -> dict[str, str]:
-        """Delete a group with no rules left; returns connections where DROP ROLE failed."""
+    async def _set_description(self, object_id: str, description: str | None) -> None:
+        """Update display text; the caller holds the SQLite transaction."""
+        if description is None:
+            await self._db.execute("DELETE FROM descriptions WHERE object = ?", (object_id,))
+        else:
+            await self._db.execute(
+                "INSERT INTO descriptions (object, description, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(object) DO UPDATE SET "
+                "description = excluded.description, updated_at = excluded.updated_at",
+                (object_id, description, metadata.now_iso()),
+            )
+
+    async def set_description(
+        self, actor: AdminUser, object_id: str, description: str | None
+    ) -> None:
+        """Set display-only text for an OpenFGA object, or remove it with None."""
+        if len(object_id) > ids.MAX_OBJECT_LEN or "#" in object_id:
+            raise ValueError(f"invalid object id: {object_id!r}")
+        match object_id.partition(":")[0]:
+            case "user":
+                ids.parse_user(object_id)
+            case "group":
+                ids.parse_group(object_id)
+            case "column":
+                ids.parse_column(object_id)
+            case "gateway":
+                if object_id != ids.GATEWAY_MAIN:
+                    raise ValueError(f"invalid gateway id: {object_id!r}")
+            case "db_schema":
+                ids.parse_db_schema(object_id)
+            case "db_table":
+                ids.parse_db_table(object_id)
+            case "row_set":
+                ids.parse_row_set(object_id)
+            case _:
+                raise ValueError(f"unknown object type: {object_id!r}")
+        async with self._lock:
+            async with metadata.transaction(self._db):
+                await self._set_description(object_id, description)
+                await self._audit(
+                    actor,
+                    "set_description",
+                    {"object_id": object_id, "description": description},
+                    None,
+                )
+
+    async def list_groups(self) -> list[GroupInfo]:
+        """List existing groups sorted by name, with optional SQLite display text."""
+        groups = await self._store.read(ids.GATEWAY_MAIN, "group")
+        async with self._db.execute("SELECT object, description FROM descriptions") as cur:
+            descriptions: dict[str, str] = {row[0]: row[1] for row in await cur.fetchall()}
+        return sorted(
+            (GroupInfo(ids.parse_group(t.user), descriptions.get(t.user)) for t in groups),
+            key=lambda group: group.name,
+        )
+
+    async def delete_group(self, actor: AdminUser, name: str) -> str:
+        """Delete a rule-free group and inline revoke its members before dropping its role."""
         async with self._lock:
             await self._require_group(name)
             rules = await self._group_rules(name)
@@ -294,28 +332,29 @@ class RuleService:
                 held = ", ".join(f"{t.object}#{t.relation}" for t in rules)
                 raise RuleConflict(f"group {name} still has rules: {held}")
             members = await self._store.read(ids.group(name), "member")
-            await self._write(deletes=members)
-            async with metadata.transaction(self._db):
-                await self._db.execute("DELETE FROM groups WHERE name = ?", (name,))
-                await self._audit(actor, "delete_group", {"name": name}, None, deleted=members)
-            await self._inline_revoke(members)
-            failed = await self._apply_everywhere(
-                list(await self._connections()), DropGroupRole(group_role(name))
-            )
-            if failed:
-                async with metadata.transaction(self._db):
-                    await audit.record(
-                        self._db,
-                        "sync",
-                        user_id=actor.id,
-                        error="; ".join(f"{name}: {error}" for name, error in failed.items()),
-                        detail={
-                            "action": "delete_group",
-                            "name": name,
-                            "failed_connections": failed,
-                        },
+            deleted = [*members, ids.group_tuple(name)]
+            # Batch members first; only the final batch removes group existence.
+            removed: list[Tuple] = []
+            try:
+                for i in range(0, len(deleted), MAX_TUPLES_PER_WRITE):
+                    batch = deleted[i : i + MAX_TUPLES_PER_WRITE]
+                    await self._write(deletes=batch)
+                    removed.extend(batch)
+            except Exception as exc:
+                if removed:
+                    await self._record(
+                        actor,
+                        "delete_group",
+                        {"name": name},
+                        deleted=removed,
+                        error=f"{type(exc).__name__}: {exc}",
                     )
-            return failed
+                    await self._inline_revoke(removed)
+                raise
+            async with metadata.transaction(self._db):
+                await self._set_description(ids.group(name), None)
+                await self._audit(actor, "delete_group", {"name": name}, None, deleted=deleted)
+            return await self._inline_revoke(deleted)
 
     async def add_member(self, actor: AdminUser, group: str, user_id: int) -> None:
         await self._member(actor, "add_member", group, user_id)

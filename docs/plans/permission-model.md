@@ -67,6 +67,7 @@ type group
 type gateway
   relations
     define admin: [user]
+    define group: [group]
 type db_schema
   relations
     define reader: [group#member]
@@ -94,6 +95,7 @@ type row_set
 | `row_set:c/s/t/col=v#reader@group:g#member` | `row_grants(g_g, s, t, v)`（`s`、`t` 由 `table` 關係取得） | 刪除該筆 |
 | `row_set:...#table@db_table:...` | 無 | 無 |
 | `db_table:c/s/t#row_column@column:col` | 宣告列級受控：`ENABLE` + `FORCE ROW LEVEL SECURITY`、建立 `gw_passthrough` 與 `gw_read`、`GRANT SELECT ON s.t TO gw_managed` | 取消列級受控：`DROP POLICY` ×2、`NO FORCE` + `DISABLE ROW LEVEL SECURITY`、`REVOKE SELECT ON s.t FROM gw_managed` |
+| `gateway:main#group@group:g` | `CREATE ROLE g_g NOLOGIN`（每個連線） | `DROP ROLE g_g`（先刪該群組的 `row_grants`） |
 | `gateway:main#admin@user:u` | 無（只更新 admin 快取） | 無 |
 
 不屬於任何 tuple、一次性的設定：
@@ -192,7 +194,7 @@ GRANT SELECT ON s.t TO gw_managed;
 
 ### 2.6 OpenFGA 物件 id
 
-- `user:<users.id>`、`group:<groups.name>`、`gateway:main`、`column:<column>`
+- `user:<users.id>`、`group:<name>`、`gateway:main`、`column:<column>`
 - `db_schema:<conn>/<schema>`、`db_table:<conn>/<schema>/<table>`、`row_set:<conn>/<schema>/<table>/<column>=<value>`
 - `<conn>` 用 `connections.name`
 - 每段以 percent-encoding 跳脫 `/ = : # @ % 空白`；超過 OpenFGA 長度上限時拒絕寫入（低基數欄位不會碰到）
@@ -321,3 +323,19 @@ tests/
 - 宣告：RuleService 先以 executor 套用 `EnableRowPolicy`（有 op 被略過也算失敗），成功後才寫 tuple；寫 tuple 失敗時套用 `DisableRowPolicy` 撤回。取消宣告：先刪 tuple，再套用 `DisableRowPolicy`（失敗只記錄，Syncer 會再套用）
 - PG 上有 `gw_*` policy 但 OpenFGA 沒有對應宣告時，Reconciler 只回報，不自動移除
 - 由非管理帳號（例如 superuser 手動）授予的 membership，管理帳號撤不掉；Syncer 回報錯誤並註明需人工以 superuser 撤銷，不自動提權
+
+## 11. 已確認的決定（2026-10-18，W4 gate 後）
+
+- 群組是否存在改由 OpenFGA 的 `gateway:main#group@group:<name>` 決定，刪除 SQLite 的 `groups` 表。SQLite 不再存任何權限相關狀態，只剩使用者、session、連線設定、同步位置與稽核
+- 說明文字放 SQLite 的 `descriptions` 表（key 為 OpenFGA 物件 id，例如 `group:analysts`），只是顯示用，不決定物件是否存在；刪除群組時一併刪除
+- 建立群組：寫入 group tuple，`g_*` role 由 Syncer 依變更串流建立（與其他授權一樣）；刪除群組：群組底下沒有規則時，在同一次寫入刪除所有 member tuple 與 group tuple，內聯套用 `DROP ROLE`，回 `synced` / `pending`
+- Reconciler：OpenFGA 沒有 group tuple 的 `g_*` role 直接 `DropGroupRole`（同一個 PG cluster 只有一套 gateway，`g_*` 都是 gateway 建的）
+- Reconciler 是 drift 偵測，不是防 DB owner 的安全邊界：owner 本來就能關掉 RLS，owner 的竄改不在防護範圍內
+- 新增 `w5-scan`：找出會繞過列級控制的 view，授權會讓群組讀到它們時（表規則，或 schema 規則涵蓋到它）拒絕。policy 用 `session_user` 判斷且表有 FORCE RLS，所以一般 owner 的非 invoker view 不會漏資料；會漏的是：
+  - owner 是 superuser 或 BYPASSRLS、直接讀受控表的非 invoker view（RLS 對它整個跳過）
+  - 讀到受控表、或查詢裡呼叫任何使用者函式的 materialized view（內容是 REFRESH 時以管理者身分算出來的）
+  - 直接讀受控表的分割家族成員（父表或分割區）、但該成員本身沒有列級控制的非 invoker view（不論 owner）：RLS 只套用在查詢指名的那張表
+  - 查詢裡呼叫 owner 為 superuser 或 BYPASSRLS 的 `SECURITY DEFINER` 函式的 view（保守處理，不分析函式內容）
+  - 經由任何路徑讀到上述各項的 view（包含 invoker view）
+  - 不分析 foreign table：建立 foreign server 與 user mapping 屬於 DB owner 的設定，不在防護範圍內
+- `SECURITY DEFINER` 函式只回報，並標出 owner 是否會跳過 RLS

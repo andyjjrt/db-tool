@@ -1,7 +1,7 @@
 """Full comparison of the OpenFGA tuples with one target database (plan §2.1, §2.7, §10).
 
 The expected PG state is the union of ``grant_ops`` of every tuple (restricted to the
-connection) plus a ``g_<name>`` role for every SQLite group. ``diff`` compares it with the
+connection), including ``g_<name>`` roles from gateway group tuples. ``diff`` compares it with the
 ``ActualState`` and returns the fixes and the report-only findings; it is a pure function.
 ``Reconciler.reconcile`` runs the whole unit (read tuples, read the catalog, diff, apply,
 audit) under ``locks(connection)``, so the Syncer and inline revokes never interleave.
@@ -11,7 +11,9 @@ every non-system schema of the target DB (``pg_catalog``, ``information_schema``
 ``pg_toast*``, ``pg_temp*``, ``gateway_acl`` and ``paradedb`` are excluded).
 
 Fixed (applied unless ``dry_run``):
-  - a SQLite group without its ``g_<name>`` role: ``CreateGroupRole``;
+  - a gateway group tuple without its ``g_<name>`` role: ``CreateGroupRole``;
+  - a ``g_*`` role without a gateway group tuple: ``DropGroupRole`` after revoking its
+    grants and memberships (one gateway owns all ``g_*`` roles in the cluster);
   - missing expected table SELECT, default privileges, ``row_grants`` rows and memberships:
     the grant op; present but unexpected ones for ``g_*`` grantees, ``row_grants`` rows and
     ``u_*`` memberships in ``g_*`` roles granted only by the admin account: the inverse op;
@@ -25,15 +27,20 @@ that is created at the user's first session) are not planned, so they never show
 
 Reported only, never changed: ``gw_*`` policies on a table with no ``row_column`` tuple,
 other permissive policies on a row-controlled table,
-``g_*`` roles without a SQLite group, a schema with rules where ``gw_managed`` lacks USAGE
+a schema with rules where ``gw_managed`` lacks USAGE
 (operator setup), a ``u_*`` membership in a ``g_*`` role granted by another role than the
-admin account (never revoked), ``u_*`` roles that are not members of ``gw_managed``, SELECT on
+admin account (never explicitly revoked), ``u_*`` roles that are not members of ``gw_managed``,
+SELECT on
 a table granted directly to ``gw_managed`` / ``u_*`` without a declaration, tuples the mapping
 rejects, a declared table that does not exist and two ``row_column`` tuples on one table.
+Dropping an orphan role also removes its ``u_*`` memberships from other grantors.
 
-Applying: one ``executor.apply`` call per fix kind (op class), in a fixed order (roles,
-row_grants deletes, revokes, grants, row_grants upserts, RLS). A kind that fails is reported
-in ``error`` / ``failed`` and does not stop the others; the next run retries it. An audit row
+Applying: one ``executor.apply`` call per fix kind (op class), in a fixed order (role creates,
+row_grants deletes, revokes, role drops, grants, row_grants upserts, RLS). Role drops follow
+all revokes, with each orphan drop in its own transaction. An orphan drop's ``ApplyError``
+with a known op and SQLSTATE 42501 or 2BP01 is reported as ``undroppable_group_role`` drift
+including the SQLSTATE, not a failed fix. Other failures are reported in ``error`` / ``failed``
+and do not stop the others; the next run retries them. An audit row
 of kind ``sync`` is written when at least one fix was applied and ``dry_run`` is false.
 """
 
@@ -58,6 +65,7 @@ from db_gateway.permissions.context import (
     load_connections,
     mapping_context,
 )
+from db_gateway.permissions.executor import ApplyError
 from db_gateway.permissions.executor_protocol import Executor
 from db_gateway.permissions.mapping import grant_ops
 from db_gateway.permissions.store import PermissionStore, Tuple
@@ -65,6 +73,7 @@ from db_gateway.permissions.types import (
     GW_MANAGED,
     CreateGroupRole,
     DeleteRowGrant,
+    DropGroupRole,
     EnableRowPolicy,
     GrantAllTablesSelect,
     GrantDefaultSelect,
@@ -76,7 +85,6 @@ from db_gateway.permissions.types import (
     RevokeMembership,
     RevokeTableSelect,
     UpsertRowGrant,
-    group_role,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +98,7 @@ _ORDER: tuple[type[PgOp], ...] = (
     RevokeMembership,
     RevokeTableSelect,
     RevokeDefaultSelect,
+    DropGroupRole,
     GrantMembership,
     GrantAllTablesSelect,
     GrantTableSelect,
@@ -242,13 +251,12 @@ def policy_ok(
 def diff(
     *,
     ops: Sequence[PgOp],
-    groups: Collection[str],
     actual: ActualState,
     relations: Mapping[str, Collection[str]],
     schemas: Collection[str],
     admin: str,
 ) -> Plan:
-    """Compare the expected ops and groups with the actual state.
+    """Compare the expected tuple-derived ops with the actual state.
 
     ``relations`` maps each schema to its tables, views, materialized views and foreign tables
     (what ``GRANT ... ON ALL TABLES IN SCHEMA`` covers); ``admin`` is the gateway's admin
@@ -260,14 +268,11 @@ def diff(
 
     # roles
     roles = set(actual.roles)
-    wanted_roles = {group_role(name) for name in groups}
+    wanted_roles = {op.role for op in ops if isinstance(op, CreateGroupRole)}
     creates = [CreateGroupRole(role) for role in sorted(wanted_roles - roles)]
     fixes.extend(creates)
-    roles_after = roles | wanted_roles
-    reported.extend(
-        Drift("unknown_group_role", f"role {role} has no group in SQLite")
-        for role in sorted(r for r in roles if r.startswith("g_") and r not in wanted_roles)
-    )
+    orphan_roles = {r for r in roles if r.startswith("g_") and r not in wanted_roles}
+    roles_after = (roles - orphan_roles) | wanted_roles
 
     # the expected state, from the ops
     members: set[tuple[str, str]] = set()
@@ -416,6 +421,8 @@ def diff(
         )
     )
 
+    fixes.extend(DropGroupRole(role) for role in sorted(orphan_roles))
+
     # grants after the revokes
     fixes.extend(grant_members)
     fixes.extend(GrantAllTablesSelect(s, r) for s, r in sorted(grant_all))
@@ -533,10 +540,6 @@ class Reconciler:
         self._locks = locks
         self._stop = asyncio.Event()
 
-    async def _groups(self) -> list[str]:
-        async with self._db.execute("SELECT name FROM groups ORDER BY name") as cur:
-            return [row[0] for row in await cur.fetchall()]
-
     async def reconcile(self, connection: str, *, dry_run: bool = False) -> ReconcileReport:
         async with self._locks(connection):
             return await self._reconcile(connection, dry_run)
@@ -552,13 +555,11 @@ class Reconciler:
         info = await load_connection(self._db, connection)
         ctx = mapping_context(await load_connections(self._db))
         tuples = await self._store.read()
-        groups = await self._groups()
         ops, reported = expected_ops(tuples, ctx, connection)
         async with await self._connect(connection) as conn:
             admin, schemas, relations, state = await _snapshot(conn, info.default_privilege_owners)
         plan = diff(
             ops=ops,
-            groups=groups,
             actual=state,
             relations=relations,
             schemas=schemas,
@@ -570,18 +571,37 @@ class Reconciler:
             return report
         errors: list[str] = []
         for kind in _ORDER:
-            batch = [op for op in plan.fixes if type(op) is kind]
-            if not batch:
+            kind_ops = [op for op in plan.fixes if type(op) is kind]
+            if not kind_ops:
                 continue
-            try:
-                skipped = await self._executor.apply(connection, batch)
-            except Exception as exc:
-                logger.warning("reconcile of %s failed on %s: %s", connection, kind.__name__, exc)
-                errors.append(f"{kind.__name__}: {exc}")
-                report.failed.extend(batch)
-                continue
-            report.skipped.extend(skipped)
-            report.fixes.extend(op for op in batch if op not in skipped)
+            batches = [[op] for op in kind_ops] if kind is DropGroupRole else [kind_ops]
+            for batch in batches:
+                try:
+                    skipped = await self._executor.apply(connection, batch)
+                except Exception as exc:
+                    logger.warning(
+                        "reconcile of %s failed on %s: %s", connection, kind.__name__, exc
+                    )
+                    if (
+                        isinstance(batch[0], DropGroupRole)
+                        and isinstance(exc, ApplyError)
+                        and exc.op is not None
+                        and isinstance(exc.original, psycopg.Error)
+                        and exc.original.sqlstate in {"42501", "2BP01"}
+                    ):
+                        report.reported.append(
+                            Drift(
+                                "undroppable_group_role",
+                                f"cannot drop role {batch[0].role} "
+                                f"(SQLSTATE {exc.original.sqlstate}): {exc}",
+                            )
+                        )
+                    else:
+                        errors.append(f"{kind.__name__}: {exc}")
+                        report.failed.extend(batch)
+                    continue
+                report.skipped.extend(skipped)
+                report.fixes.extend(op for op in batch if op not in skipped)
         if errors:
             report.error = "; ".join(errors)
         if report.fixes:

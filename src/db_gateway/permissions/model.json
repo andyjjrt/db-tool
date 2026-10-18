@@ -31,6 +31,9 @@
       "relations": {
         "admin": {
           "this": {}
+        },
+        "group": {
+          "this": {}
         }
       },
       "metadata": {
@@ -39,6 +42,13 @@
             "directly_related_user_types": [
               {
                 "type": "user"
+              }
+            ]
+          },
+          "group": {
+            "directly_related_user_types": [
+              {
+                "type": "group"
               }
             ]
           }

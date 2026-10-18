@@ -3,12 +3,16 @@
 import asyncio
 from collections.abc import Collection, Mapping
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
+import psycopg
 import pytest
 
+from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.actual import ActualState, RowPolicy
 from db_gateway.permissions.context import ConnectionLocks
+from db_gateway.permissions.executor import ApplyError, TransientApplyError
 from db_gateway.permissions.reconciler import (
     ReconcileFailed,
     Reconciler,
@@ -18,9 +22,11 @@ from db_gateway.permissions.reconciler import (
     policy_ok,
 )
 from db_gateway.permissions.store import Tuple
+from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.types import (
     CreateGroupRole,
     DeleteRowGrant,
+    DropGroupRole,
     EnableRowPolicy,
     GrantAllTablesSelect,
     GrantDefaultSelect,
@@ -90,10 +96,9 @@ def run(
     relations: Mapping[str, Collection[str]] = RELATIONS,
     schemas: Collection[str] = ("s",),
 ):
-    ops, invalid = expected_ops(tuples, CTX, "prod")
+    ops, invalid = expected_ops([*(ids.group_tuple(name) for name in groups), *tuples], CTX, "prod")
     plan = diff(
         ops=ops,
-        groups=groups,
         actual=actual or state(),
         relations=relations,
         schemas=schemas,
@@ -173,8 +178,9 @@ def test_unexpected_g_select_and_defaults_and_rows_are_revoked() -> None:
         RevokeTableSelect("s", "t", "g_b"),
         RevokeDefaultSelect("owner", "s", "g_b"),
         DeleteRowGrant("g_b", "s", "t", "x"),
+        DropGroupRole("g_b"),
     }
-    assert kinds(reported) == {"unknown_group_role"}
+    assert reported == []
 
 
 def test_row_grant_with_wrong_column_is_replaced() -> None:
@@ -202,7 +208,7 @@ def test_role_created_in_the_same_run_gets_its_rules() -> None:
 
 
 def test_ops_the_executor_would_skip_are_not_planned() -> None:
-    # no group in SQLite -> no role -> nothing for g_a; u_7 has no role yet
+    # no group tuple -> no role -> nothing for g_a; u_7 has no role yet
     fixes, _ = run([TABLE_RULE, MEMBER, ROW_RULE], state(), [])
     assert fixes == []
     fixes, _ = run([MEMBER], state(roles={"g_a"}), ["a"])
@@ -257,14 +263,12 @@ def test_foreign_grantor_membership_is_never_revoked() -> None:
 
 def test_admin_named_like_a_personal_role_is_left_alone() -> None:
     actual = state(roles={"g_a", "u_7"}, memberships={("g_a", "u_7", "u_7", True, False, False)})
-    ops, _ = expected_ops([MEMBER], CTX, "prod")
-    plan = diff(
-        ops=ops, groups=["a"], actual=actual, relations=RELATIONS, schemas=["s"], admin="u_7"
-    )
+    ops, _ = expected_ops([ids.group_tuple("a"), MEMBER], CTX, "prod")
+    plan = diff(ops=ops, actual=actual, relations=RELATIONS, schemas=["s"], admin="u_7")
     assert plan.fixes == []
     assert plan.reported == []
     plan = diff(
-        ops=[], groups=["a"], actual=actual, relations=RELATIONS, schemas=["s"], admin="u_7"
+        ops=[CreateGroupRole("g_a")], actual=actual, relations=RELATIONS, schemas=["s"], admin="u_7"
     )
     assert plan.fixes == []
 
@@ -445,23 +449,58 @@ def test_fix_list_has_no_duplicates() -> None:
     assert len(fixes) == len(set(fixes))
 
 
+def test_group_tuples_define_wanted_roles_on_every_connection() -> None:
+    for connection in CTX.connections:
+        ops, invalid = expected_ops([ids.group_tuple("a")], CTX, connection)
+        assert ops == [CreateGroupRole("g_a")]
+        assert invalid == []
+    fixes, reported = run([ids.group_tuple("a")], state(roles={"g_b"}))
+    assert fixes == [CreateGroupRole("g_a"), DropGroupRole("g_b")]
+    assert reported == []
+
+
+def test_orphan_role_is_dropped_after_grants_rows_and_members_are_revoked() -> None:
+    actual = state(
+        roles={"g_b", "u_7"},
+        table_select={("s", "t", "g_b")},
+        default_select={("owner", "s", "g_b")},
+        row_grants={("g_b", "s", "t", "team", "x")},
+        memberships={
+            ("g_b", "u_7", ADMIN, False, True, True),
+            ("gw_managed", "u_7", ADMIN, False, True, True),
+        },
+    )
+    fixes, reported = run([], actual)
+    assert fixes[-1] == DropGroupRole("g_b")
+    assert set(fixes[:-1]) == {
+        RevokeTableSelect("s", "t", "g_b"),
+        RevokeDefaultSelect("owner", "s", "g_b"),
+        DeleteRowGrant("g_b", "s", "t", "x"),
+        RevokeMembership("g_b", "u_7"),
+    }
+    assert reported == []
+
+
 async def test_run_periodic_runs_at_start_then_every_interval_until_stopped() -> None:
     reconciler = Reconciler(None, None, None, None, ConnectionLocks())  # type: ignore[arg-type]
     calls = 0
+    third_round = asyncio.Event()
 
     async def reconcile_all(dry_run: bool = False) -> dict[str, ReconcileReport]:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("one bad round does not stop the loop")
+        if calls == 3:
+            reconciler.stop()
+            third_round.set()
         return {}
 
     reconciler.reconcile_all = reconcile_all  # type: ignore[method-assign]
     task = asyncio.create_task(reconciler.run_periodic(0.01))
-    await asyncio.sleep(0.15)
-    reconciler.stop()
+    await asyncio.wait_for(third_round.wait(), 2)
     await asyncio.wait_for(task, 1)
-    assert calls >= 3
+    assert calls == 3
 
 
 async def test_reconcile_strict_raises_on_error_or_failed_fixes() -> None:
@@ -481,3 +520,66 @@ async def test_reconcile_strict_raises_on_error_or_failed_fixes() -> None:
         with pytest.raises(ReconcileFailed) as raised:
             await reconciler.reconcile_strict("c")
         assert raised.value.report.connection == "c"
+
+
+@pytest.mark.parametrize("error_type", [ApplyError, TransientApplyError])
+@pytest.mark.parametrize(
+    "sqlstate, has_op, drift",
+    [
+        ("42501", True, True),
+        ("2BP01", True, True),
+        ("42501", False, False),
+        ("2BP01", False, False),
+        ("40P01", True, False),
+        ("55P03", True, False),
+        ("57014", True, False),
+        ("08006", True, False),
+        (None, True, False),
+    ],
+)
+async def test_orphan_drop_classifies_only_known_operation_privilege_and_dependency_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[ApplyError],
+    sqlstate: str | None,
+    has_op: bool,
+    drift: bool,
+) -> None:
+    drop = DropGroupRole("g_orphan")
+    original: Exception = RuntimeError("original failure")
+    if sqlstate is not None:
+        pg_error = psycopg.Error("original failure")
+        pg_error.sqlstate = sqlstate
+        original = pg_error
+    error = error_type("prod", drop if has_op else None, original)
+    executor = AsyncMock()
+    executor.apply.side_effect = error
+    monkeypatch.setattr(
+        "db_gateway.permissions.reconciler._snapshot",
+        AsyncMock(return_value=(ADMIN, ["s"], RELATIONS, state(roles={"g_orphan"}))),
+    )
+    db = await metadata.connect(":memory:")
+    try:
+        await metadata.migrate(db)
+        async with metadata.transaction(db):
+            await db.execute(
+                "INSERT INTO connections (name, host, dbname, admin_secret_ref) "
+                "VALUES ('prod', 'h', 'd', 'ref')"
+            )
+        reconciler = Reconciler(db, MemoryStore(), executor, AsyncMock(), ConnectionLocks())
+        if drift:
+            report = await reconciler.reconcile_strict("prod")
+            assert report.failed == [] and report.error is None
+            (finding,) = report.reported
+            assert finding.kind == "undroppable_group_role"
+            assert sqlstate is not None and sqlstate in finding.message
+            assert str(original) in finding.message
+        else:
+            with pytest.raises(ReconcileFailed) as failure:
+                await reconciler.reconcile_strict("prod")
+            report = failure.value.report
+            assert report.failed == [drop]
+            assert report.error is not None and str(error) in report.error
+            assert report.reported == []
+        executor.apply.assert_awaited_once_with("prod", [drop])
+    finally:
+        await db.close()

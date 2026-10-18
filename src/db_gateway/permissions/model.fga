@@ -12,6 +12,7 @@ type group
 type gateway
   relations
     define admin: [user]
+    define group: [group]
 
 type db_schema
   relations

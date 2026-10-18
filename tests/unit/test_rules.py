@@ -2,8 +2,9 @@
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
-from typing import Any, Literal
+from typing import Any
 
 import aiosqlite
 import pytest
@@ -11,14 +12,11 @@ import pytest
 from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.admin import AdminForbidden, AdminUser, admin_tuple
-from db_gateway.permissions.context import ConnectionLocks
-from db_gateway.permissions.rules import NotFound, RuleConflict, RuleService
-from db_gateway.permissions.store import PermissionStoreUnavailable, Tuple
+from db_gateway.permissions.rules import GroupInfo, NotFound, RuleConflict, RuleService
+from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStoreUnavailable, Tuple
 from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.types import (
-    CreateGroupRole,
     DisableRowPolicy,
-    DropGroupRole,
     EnableRowPolicy,
     PgOp,
 )
@@ -481,42 +479,271 @@ async def test_undeclare_blocked_by_row_set_parent_tuple(
     assert len(await audit_rows(db)) == 1  # only the declare
 
 
-# --- groups on every connection --------------------------------------------------------
+# --- tuple-backed groups and display text -----------------------------------------------
 
 
-async def test_create_and_delete_group_reach_every_connection(
+async def test_create_and_delete_group_write_tuples_without_direct_pg_work(
     svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
-    assert await svc.create_group(INITIAL, "g1", "desc") == {}
-    assert executor.calls == [
-        ("prod", [CreateGroupRole("g_g1")]),
-        ("dev", [CreateGroupRole("g_g1")]),
+    assert await svc.create_group(INITIAL, "g1", "desc") is None
+    assert executor.calls == []
+    assert await store.read(ids.GATEWAY_MAIN, "group") == [ids.group_tuple("g1")]
+    assert await svc.list_groups() == [GroupInfo("g1", "desc")]
+    assert (await audit_rows(db))[0]["detail"]["written"] == [
+        {"user": "group:g1", "relation": "group", "object": ids.GATEWAY_MAIN}
     ]
     await svc.add_member(INITIAL, "g1", 4)
     executor.calls.clear()
-    assert await svc.delete_group(INITIAL, "g1") == {}
-    assert executor.calls == [
-        ("prod", [DropGroupRole("g_g1")]),
-        ("dev", [DropGroupRole("g_g1")]),
-    ]
+    assert await svc.delete_group(INITIAL, "g1") == "pending"
+    assert executor.calls == []
     assert await store.read(ids.group("g1"), "member") == []
-    assert await count(db, "groups") == 0
+    assert await store.read(ids.GATEWAY_MAIN, "group") == []
+    assert await count(db, "descriptions") == 0
+    assert await svc.list_groups() == []
 
 
-async def test_failing_connection_is_reported_and_group_kept(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+async def test_unavailable_pg_does_not_block_group_creation(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
-    executor.fail_on = {"dev"}
-    failed = await svc.create_group(INITIAL, "g1", None)
-    assert list(failed) == ["dev"]
-    assert "boom" in failed["dev"]
-    assert await count(db, "groups") == 1
-    assert [c for c, _ in executor.calls] == ["prod", "dev"]  # prod still attempted
+    executor.fail_on = {"prod", "dev"}
+    assert await svc.create_group(INITIAL, "g1") is None
+    assert await store.read(ids.GATEWAY_MAIN, "group") == [ids.group_tuple("g1")]
+    assert await count(db, "descriptions") == 0
+    assert executor.calls == []
     (row,) = await audit_rows(db)
-    assert list(row["detail"]["failed_connections"]) == ["dev"]
+    assert row["kind"] == "admin" and row["error"] is None
 
-    assert list(await svc.delete_group(INITIAL, "g1")) == ["dev"]
-    assert await count(db, "groups") == 0
+
+async def test_list_groups_uses_only_gateway_tuples_and_joins_descriptions(
+    svc: RuleService, store: MemoryStore
+) -> None:
+    await svc.set_description(INITIAL, ids.group("orphan"), "display only")
+    await store.write([Tuple(ids.user(4), "member", ids.group("members_only"))])
+    assert await svc.list_groups() == []
+    with pytest.raises(NotFound):
+        await svc.add_member(INITIAL, "orphan", 4)
+    await store.write([ids.group_tuple("z"), ids.group_tuple("a")])
+    await svc.set_description(INITIAL, ids.group("a"), "")
+    await svc.set_description(INITIAL, ids.db_table("prod", "public", "t"), "table text")
+    assert await svc.list_groups() == [GroupInfo("a", ""), GroupInfo("z", None)]
+    await svc.add_member(INITIAL, "z", 4)  # no SQLite group row is needed
+
+
+async def test_set_description_upserts_deletes_and_audits(
+    svc: RuleService, db: aiosqlite.Connection, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps = iter(["2026-10-18T00:00:00.000Z", "2026-10-18T00:00:01.000Z"])
+    monkeypatch.setattr(metadata, "now_iso", lambda: next(timestamps))
+    await svc.set_description(INITIAL, "group:g1", "first")
+    await svc.set_description(INITIAL, "group:g1", "second")
+    async with db.execute("SELECT object, description, updated_at FROM descriptions") as cur:
+        assert await cur.fetchall() == [("group:g1", "second", "2026-10-18T00:00:01.000Z")]
+    await svc.set_description(INITIAL, "group:g1", None)
+    await svc.set_description(INITIAL, "group:missing", None)
+    assert await count(db, "descriptions") == 0
+    assert await store.read() == []
+    rows = await audit_rows(db)
+    assert len(rows) == 4
+    assert all(row["kind"] == "admin" for row in rows)
+    assert [row["detail"]["description"] for row in rows] == ["first", "second", None, None]
+
+
+@pytest.mark.parametrize(
+    "object_id",
+    [
+        ids.user(4),
+        ids.group('a /:#"'),
+        ids.column("team /:#"),
+        ids.GATEWAY_MAIN,
+        ids.db_schema("prod", "public"),
+        ids.db_table("prod", "public", "t"),
+        ids.row_set("prod", "public", "t", "team", "a /:#"),
+    ],
+)
+async def test_set_description_accepts_known_object_types(
+    svc: RuleService, db: aiosqlite.Connection, object_id: str
+) -> None:
+    await svc.set_description(INITIAL, object_id, "text")
+    async with db.execute("SELECT object, description FROM descriptions") as cur:
+        assert await cur.fetchall() == [(object_id, "text")]
+    await svc.set_description(INITIAL, object_id, None)
+    assert await count(db, "descriptions") == 0
+
+
+@pytest.mark.parametrize("description", ["text", None])
+@pytest.mark.parametrize(
+    "object_id",
+    [
+        "",
+        "unknown:a",
+        "group",
+        "group:",
+        "group:a#member",
+        "group:%61",
+        "group:a/b",
+        "group:" + "a" * ids.MAX_OBJECT_LEN,
+        "user:01",
+        "user:-1",
+        "column:",
+        "column:team/name",
+        "gateway:other",
+        "db_schema:prod",
+        "db_schema:prod/public/extra",
+        "db_table:prod/public",
+        "row_set:prod/public/t/team",
+        "row_set:prod/public/t/team=a=b",
+        "row_set:prod/public/t/team=",
+    ],
+)
+async def test_set_description_rejects_invalid_objects_without_writes(
+    svc: RuleService, db: aiosqlite.Connection, object_id: str, description: str | None
+) -> None:
+    with pytest.raises(ValueError):
+        await svc.set_description(INITIAL, object_id, description)
+    assert await count(db, "descriptions") == 0
+    assert await count(db, "audit_log") == 0
+
+
+async def test_create_group_upserts_existing_display_text(
+    svc: RuleService, store: MemoryStore
+) -> None:
+    await svc.set_description(INITIAL, "group:g1", "old")
+    await svc.create_group(INITIAL, "g1", "new")
+    assert await svc.list_groups() == [GroupInfo("g1", "new")]
+    with pytest.raises(RuleConflict):
+        await svc.create_group(INITIAL, "g1", "overwrite")
+    assert await svc.list_groups() == [GroupInfo("g1", "new")]
+    await store.write([ids.group_tuple("external")])
+    with pytest.raises(RuleConflict):
+        await svc.create_group(INITIAL, "external")
+
+
+async def test_delete_group_removes_description_and_audits_in_one_transaction(
+    svc: RuleService, db: aiosqlite.Connection, store: MemoryStore
+) -> None:
+    await svc.create_group(INITIAL, "g1", "desc")
+    # An audit FK failure rolls back the description deletion, not the store write.
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        await svc.delete_group(AdminUser(999, "missing"), "g1")
+    async with db.execute("SELECT object, description FROM descriptions") as cur:
+        assert await cur.fetchall() == [("group:g1", "desc")]
+    assert await count(db, "audit_log") == 1
+    assert await store.read() == []
+    assert await svc.list_groups() == []  # orphan display text never recreates a group
+
+
+@pytest.mark.parametrize("member_count", [0, 99, 100, 101, 205])
+async def test_group_delete_batches_members_before_existence_and_revokes_once(
+    svc: RuleService,
+    db: aiosqlite.Connection,
+    store: MemoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+    member_count: int,
+) -> None:
+    await svc.create_group(INITIAL, "g1", "desc")
+    members = [Tuple(ids.user(i), "member", ids.group("g1")) for i in range(member_count)]
+    for i in range(0, len(members), MAX_TUPLES_PER_WRITE):
+        await store.write(members[i : i + MAX_TUPLES_PER_WRITE])
+    group = ids.group_tuple("g1")
+    deleted = [*await store.read(ids.group("g1"), "member"), group]
+    if len(deleted) > MAX_TUPLES_PER_WRITE:
+        with pytest.raises(ValueError, match="at most"):
+            await store.write(deletes=deleted)
+    batches: list[list[Tuple]] = []
+    inline_calls: list[list[Tuple]] = []
+    write = store.write
+
+    async def observed(writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
+        assert svc._lock.locked()
+        assert not writes
+        assert len(deletes) <= MAX_TUPLES_PER_WRITE
+        assert group in await store.read(ids.GATEWAY_MAIN, "group")
+        batches.append(list(deletes))
+        await write(writes, deletes)
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            assert svc._lock.locked()
+            assert await store.read() == []
+            inline_calls.append(list(deletes))
+            return True
+
+    monkeypatch.setattr(store, "write", observed)
+    svc._inline = Inline()
+    assert await svc.delete_group(INITIAL, "g1") == "synced"
+    assert [item for batch in batches for item in batch] == deleted
+    assert all(group not in batch for batch in batches[:-1])
+    assert batches[-1][-1] == group
+    assert inline_calls == [deleted]
+    assert await count(db, "descriptions") == 0
+    assert await svc.list_groups() == []
+    assert len((await audit_rows(db))[-1]["detail"]["deleted"]) == member_count + 1
+
+
+@pytest.mark.parametrize("failed_batch", [2, 3])
+@pytest.mark.parametrize("inline_result", [False, True])
+async def test_group_delete_mid_batch_failure_keeps_group_and_can_be_retried(
+    svc: RuleService,
+    db: aiosqlite.Connection,
+    store: MemoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_batch: int,
+    inline_result: bool,
+) -> None:
+    await svc.create_group(INITIAL, "g1", "desc")
+    members = [Tuple(ids.user(i), "member", ids.group("g1")) for i in range(205)]
+    for i in range(0, len(members), MAX_TUPLES_PER_WRITE):
+        await store.write(members[i : i + MAX_TUPLES_PER_WRITE])
+    write = store.write
+    batches = 0
+    ordered = await store.read(ids.group("g1"), "member")
+    removed = ordered[: (failed_batch - 1) * MAX_TUPLES_PER_WRITE]
+    offline = PermissionStoreUnavailable("offline")
+    inline_calls: list[list[Tuple]] = []
+
+    async def fail_batch(writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
+        nonlocal batches
+        assert svc._lock.locked()
+        batches += 1
+        if batches == failed_batch:
+            raise offline
+        await write(writes, deletes)
+
+    class Inline:
+        async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
+            assert svc._lock.locked()
+            remaining = await store.read()
+            assert all(item not in remaining for item in deletes)
+            assert (await audit_rows(db))[-1]["detail"]["deleted"] == [
+                {"user": item.user, "relation": item.relation, "object": item.object}
+                for item in deletes
+            ]
+            inline_calls.append(list(deletes))
+            return inline_result
+
+    svc._inline = Inline()
+    monkeypatch.setattr(store, "write", fail_batch)
+    with pytest.raises(PermissionStoreUnavailable, match="offline") as failure:
+        await svc.delete_group(INITIAL, "g1")
+    assert failure.value is offline
+    assert await svc.list_groups() == [GroupInfo("g1", "desc")]
+    assert set(await store.read(ids.group("g1"), "member")) == set(ordered) - set(removed)
+    assert inline_calls == [removed]
+    rows = await audit_rows(db)
+    assert len(rows) == 2
+    assert rows[-1]["kind"] == "admin"
+    assert rows[-1]["detail"]["action"] == "delete_group"
+    assert rows[-1]["error"] == "PermissionStoreUnavailable: offline"
+    assert rows[-1]["detail"]["error"] == rows[-1]["error"]
+    assert rows[-1]["detail"]["deleted"] == [
+        {"user": item.user, "relation": item.relation, "object": item.object} for item in removed
+    ]
+    monkeypatch.setattr(store, "write", write)
+    assert await svc.delete_group(INITIAL, "g1") == ("synced" if inline_result else "pending")
+    assert await store.read() == []
+    assert await count(db, "descriptions") == 0
+    assert inline_calls[1] == [*ordered[len(removed) :], ids.group_tuple("g1")]
+    assert len(await audit_rows(db)) == 3
 
 
 # --- admins ------------------------------------------------------------------------------
@@ -569,6 +796,7 @@ async def test_every_mutating_method_writes_one_admin_audit_row(
         svc.add_admin(INITIAL, 4),
         svc.remove_admin(INITIAL, 4),
         svc.delete_group(INITIAL, "g1"),
+        svc.set_description(INITIAL, "group:g1", "display"),
     ]
     expected = [
         "create_group",
@@ -585,6 +813,7 @@ async def test_every_mutating_method_writes_one_admin_audit_row(
         "add_admin",
         "remove_admin",
         "delete_group",
+        "set_description",
     ]
     for done, step in enumerate(steps, start=1):
         await step
@@ -693,36 +922,51 @@ async def test_revoke_returns_inline_status_after_store_write_under_global_lock(
     ]
 
 
-async def test_delete_group_revokes_members_inline_and_preserves_failure_dictionary(
-    db: aiosqlite.Connection, store: MemoryStore, executor: FakeExecutor, stats: FakeStats
+@pytest.mark.parametrize("inline_result", [False, True])
+async def test_delete_group_writes_once_then_revokes_members_and_group_inline(
+    db: aiosqlite.Connection, executor: FakeExecutor, stats: FakeStats, inline_result: bool
 ) -> None:
     calls: list[list[Tuple]] = []
+    store_writes: list[tuple[list[Tuple], list[Tuple]]] = []
+
+    class Store(MemoryStore):
+        async def write(self, writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
+            store_writes.append((list(writes), list(deletes)))
+            await super().write(writes, deletes)
+
+    store = Store()
 
     class Inline:
         async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
             assert service._lock.locked()
-            assert await store.read(ids.group("g1"), "member") == []
+            assert await store.read() == []
+            assert await count(db, "descriptions") == 0
+            assert (await audit_rows(db))[-1]["detail"]["action"] == "delete_group"
             calls.append(list(deletes))
-            return True
+            return inline_result
 
     service = RuleService(db, store, executor, stats, inline=Inline())
-    await make_group(service)
+    await service.create_group(INITIAL, "g1", "desc")
     await service.add_member(INITIAL, "g1", 4)
-    executor.fail_on.add("dev")
-    failed = await service.delete_group(INITIAL, "g1")
-    assert list(failed) == ["dev"]
-    assert calls == [[Tuple(ids.user(4), "member", ids.group("g1"))]]
+    store_writes.clear()
+    result = await service.delete_group(INITIAL, "g1")
+    assert result == ("synced" if inline_result else "pending")
+    deleted = [Tuple(ids.user(4), "member", ids.group("g1")), ids.group_tuple("g1")]
+    assert store_writes == [([], deleted)]
+    assert calls == [deleted]
+    assert executor.calls == []
     rows = await audit_rows(db)
     deletion = [row for row in rows if row["detail"]["action"] == "delete_group"]
-    assert [row["kind"] for row in deletion] == ["admin", "sync"]
+    assert [row["kind"] for row in deletion] == ["admin"]
     assert deletion[0]["detail"]["deleted"] == [
-        {"user": ids.user(4), "relation": "member", "object": ids.group("g1")}
+        {"user": ids.user(4), "relation": "member", "object": ids.group("g1")},
+        {"user": ids.group("g1"), "relation": "group", "object": ids.GATEWAY_MAIN},
     ]
-    assert deletion[1]["detail"]["failed_connections"] == failed
 
 
+@pytest.mark.parametrize("kind", ["member", "group"])
 async def test_inline_not_called_when_store_delete_fails(
-    db: aiosqlite.Connection, executor: FakeExecutor, stats: FakeStats
+    db: aiosqlite.Connection, executor: FakeExecutor, stats: FakeStats, kind: str
 ) -> None:
     class Store(MemoryStore):
         async def write(self, writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
@@ -734,10 +978,16 @@ async def test_inline_not_called_when_store_delete_fails(
         async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool:
             pytest.fail("inline revoke ran before a successful store write")
 
-    service = RuleService(db, Store(), executor, stats, inline=Inline())
-    await make_group(service)
+    store = Store()
+    service = RuleService(db, store, executor, stats, inline=Inline())
+    await service.create_group(INITIAL, "g1", "desc")
     with pytest.raises(PermissionStoreUnavailable):
-        await service.remove_member(INITIAL, "g1", 4)
+        if kind == "member":
+            await service.remove_member(INITIAL, "g1", 4)
+        else:
+            await service.delete_group(INITIAL, "g1")
+    assert await service.list_groups() == [GroupInfo("g1", "desc")]
+    assert await count(db, "audit_log") == 1
 
 
 @pytest.mark.parametrize("kind", ["member", "schema", "table", "row_set", "group"])
@@ -792,50 +1042,19 @@ async def test_admin_audit_survives_cancellation_during_inline_revoke(
     for item in rows[-1]["detail"]["deleted"]:
         assert Tuple(**item) not in await store.read(item["object"])
     if kind == "group":
-        # The group row goes with the audit row, before the inline wait.
-        assert await count(db, "groups") == 0
+        assert await count(db, "descriptions") == 0
+        assert await store.read(ids.GATEWAY_MAIN, "group") == []
 
 
-@pytest.mark.parametrize("shared", [False, True])
-@pytest.mark.parametrize("dropping", [False, True])
-async def test_group_role_apply_holds_global_then_connection_lock(
-    db: aiosqlite.Connection,
-    store: MemoryStore,
-    executor: FakeExecutor,
-    stats: FakeStats,
-    monkeypatch: pytest.MonkeyPatch,
-    shared: bool,
-    dropping: bool,
+async def test_concurrent_group_creation_allows_exactly_one(
+    svc: RuleService, db: aiosqlite.Connection, store: MemoryStore
 ) -> None:
-    queued = asyncio.Event()
-    locks = ConnectionLocks()
-    service = RuleService(db, store, executor, stats, locks=locks if shared else None)
-    if not shared:
-        locks = service._locks
-    if dropping:
-        await make_group(service)
-    executor.calls.clear()
-
-    class ObservedLock(asyncio.Lock):
-        async def acquire(self) -> Literal[True]:
-            if self.locked():
-                queued.set()
-            return await super().acquire()
-
-    locks._locks["prod"] = ObservedLock()
-    apply = executor.apply
-
-    async def observe(connection: str, ops: Sequence[PgOp]) -> Sequence[PgOp]:
-        assert service._lock.locked()
-        assert locks(connection).locked()
-        return await apply(connection, ops)
-
-    monkeypatch.setattr(executor, "apply", observe)
-    async with locks("prod"):
-        task = asyncio.create_task(
-            service.delete_group(INITIAL, "g1") if dropping else service.create_group(INITIAL, "g1")
-        )
-        await asyncio.wait_for(queued.wait(), 2)
-        assert executor.calls == []
-    assert await asyncio.wait_for(task, 2) == {}
-    assert [name for name, _ in executor.calls] == ["prod", "dev"]
+    results = await asyncio.gather(
+        svc.create_group(INITIAL, "g1", "first"),
+        svc.create_group(INITIAL, "g1", "second"),
+        return_exceptions=True,
+    )
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, RuleConflict) for result in results) == 1
+    assert await store.read() == [ids.group_tuple("g1")]
+    assert await count(db, "audit_log") == 1

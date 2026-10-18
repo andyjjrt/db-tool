@@ -12,7 +12,7 @@ import pytest_asyncio
 from psycopg.sql import SQL, Identifier, Literal
 
 from db_gateway import metadata
-from db_gateway.permissions import actual
+from db_gateway.permissions import actual, ids
 from db_gateway.permissions.admin import AdminUser
 from db_gateway.permissions.context import ConnectionLocks
 from db_gateway.permissions.executor import PgExecutor
@@ -120,7 +120,7 @@ async def sync_target(
         stats = AsyncMock()
         rules = RuleService(db, store, executor, stats, inline=syncer, locks=syncer._locks)
         group = unique_name("team")
-        assert await rules.create_group(actor, group) == {}
+        assert await rules.create_group(actor, group) is None
         await rules.add_member(actor, group, user_id)
         yield SyncTarget(
             db, store, syncer, rules, executor, target_admin, actor, user, group, connect
@@ -212,12 +212,12 @@ async def test_replay_from_beginning_after_grants_revokes_and_group_delete(
     await rules.grant_table_reader(actor, group, "target", schema, "other")
 
     deleted = unique_name("gone")
-    assert await rules.create_group(actor, deleted) == {}
+    assert await rules.create_group(actor, deleted) is None
     await rules.add_member(actor, deleted, actor.id)
     await rules.grant_table_reader(actor, deleted, "target", schema, "items")
     await target.syncer.sync_once("target")
     assert await rules.revoke_table_reader(actor, deleted, "target", schema, "items") == "synced"
-    assert await rules.delete_group(actor, deleted) == {}
+    assert await rules.delete_group(actor, deleted) == "synced"
     await target.syncer.sync_once("target")
     before = await target.snapshot()
     async with metadata.transaction(target.db):
@@ -236,6 +236,77 @@ async def test_replay_from_beginning_after_grants_revokes_and_group_delete(
         ).fetchall() == [(42,)]
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             await user.execute(SQL("SELECT value FROM {}").format(Identifier(schema, "items")))
+
+
+async def test_group_creation_is_streamed_and_deletion_removes_role_and_members(
+    sync_target: SyncTarget,
+) -> None:
+    target = sync_target
+    role = group_role(target.group)
+    assert role not in (await target.snapshot()).roles
+    assert await target.rules.list_groups()
+    await target.syncer.sync_once("target")
+    before = await target.snapshot()
+    assert role in before.roles
+    assert any(g == role and m == target.user.name for g, m, *_ in before.memberships)
+    await target.rules.set_description(target.actor, ids.group(target.group), "text")
+    assert await target.rules.delete_group(target.actor, target.group) == "synced"
+    after = await target.snapshot()
+    assert role not in after.roles
+    assert not any(g == role for g, *_ in after.memberships)
+    assert await target.rules.list_groups() == []
+    async with target.db.execute("SELECT * FROM descriptions") as cur:
+        assert await cur.fetchall() == []
+    await target.syncer.sync_once("target")
+    assert (await target.syncer.status())[0]["last_error"] is None
+
+
+@pytest.mark.parametrize("inline", [False, True])
+async def test_group_drop_dependency_returns_pending_and_stream_retries(
+    sync_target: SyncTarget, inline: bool
+) -> None:
+    target = sync_target
+    schema = target.admin.schema
+    role = group_role(target.group)
+    await target.syncer.sync_once("target")
+    token = (await target.syncer.status())[0]["continuation_token"]
+    # A manual grant is not an OpenFGA rule, but still prevents DROP ROLE.
+    async with await target.connect("target") as conn:
+        await conn.execute(
+            SQL("GRANT SELECT ON {} TO {}").format(Identifier(schema, "items"), Identifier(role))
+        )
+    if not inline:
+        target.rules._inline = None
+    assert await target.rules.delete_group(target.actor, target.group) == "pending"
+    assert await target.rules.list_groups() == []
+    pending = await target.snapshot()
+    assert role in pending.roles
+    if inline:
+        assert not any(g == role and m == target.user.name for g, m, *_ in pending.memberships)
+    async with target.db.execute(
+        "SELECT error FROM audit_log WHERE kind = 'sync' ORDER BY id"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    assert len(rows) == int(inline)
+    if inline:
+        assert "TransientApplyError" in rows[0][0]
+    await target.syncer.sync_once("target")
+    status = (await target.syncer.status())[0]
+    assert status["continuation_token"] == token
+    assert status["fail_count"] == 1
+    assert "TransientApplyError" in (status["last_error"] or "")
+    pending = await target.snapshot()
+    assert not any(g == role and m == target.user.name for g, m, *_ in pending.memberships)
+    async with await target.connect("target") as conn:
+        await conn.execute(
+            SQL("REVOKE SELECT ON {} FROM {}").format(Identifier(schema, "items"), Identifier(role))
+        )
+    await target.syncer.sync_once("target")
+    status = (await target.syncer.status())[0]
+    assert status["last_error"] is None
+    assert status["fail_count"] == 0
+    assert status["continuation_token"] != token
+    assert role not in (await target.snapshot()).roles
 
 
 class UnavailableStore:

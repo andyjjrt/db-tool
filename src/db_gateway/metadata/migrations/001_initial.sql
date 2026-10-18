@@ -47,31 +47,13 @@ BEGIN
     SELECT RAISE(ABORT, 'activations may only be revoked once');
 END;
 
-CREATE TABLE groups (
-    id INTEGER PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL CHECK (
-        length(name) BETWEEN 1 AND 41
-        AND substr(name, 1, 1) GLOB '[a-z]'
-        AND name NOT GLOB '*[^a-z0-9_]*'
-    ),
-    description TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        CHECK (created_at GLOB
+CREATE TABLE descriptions (
+    object TEXT PRIMARY KEY NOT NULL,
+    description TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        CHECK (updated_at GLOB
         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
 );
-CREATE TRIGGER groups_immutable_name BEFORE UPDATE OF name ON groups
-WHEN NEW.name IS NOT OLD.name
-BEGIN
-    SELECT RAISE(ABORT, 'group names are immutable');
-END;
--- Rejects any insert whose id or name already exists, so REPLACE cannot rename or
--- overwrite a row. Side effect: INSERT OR IGNORE and ON CONFLICT DO NOTHING/UPDATE also
--- raise here; idempotent writers must check for the row first.
-CREATE TRIGGER groups_no_replace BEFORE INSERT ON groups
-WHEN EXISTS (SELECT 1 FROM groups WHERE id = NEW.id OR name = NEW.name)
-BEGIN
-    SELECT RAISE(ABORT, 'groups cannot be replaced');
-END;
 
 CREATE TABLE connections (
     id INTEGER PRIMARY KEY,

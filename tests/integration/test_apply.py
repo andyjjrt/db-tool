@@ -309,6 +309,24 @@ async def test_replay_checks_every_required_object_before_running(
     assert await target.snapshot() == before
 
 
+@pytest.mark.parametrize("drop_first", [False, True])
+async def test_group_drop_and_membership_revoke_are_safe_in_either_order(
+    apply_target: ApplyTarget, drop_first: bool
+) -> None:
+    target = apply_target
+    grant = GrantMembership(target.group, target.user.name)
+    revoke = RevokeMembership(target.group, target.user.name)
+    drop = DropGroupRole(target.group)
+    await target.executor.apply("target", [grant])
+    skipped = await target.executor.apply(
+        "target", [drop, revoke] if drop_first else [revoke, drop]
+    )
+    assert skipped == ((revoke,) if drop_first else ())
+    after = await target.snapshot()
+    assert target.group not in after.roles
+    assert not any(g == target.group for g, *_ in after.memberships)
+
+
 @pytest_asyncio.fixture
 async def foreign_database_grant(
     cluster_lock: psycopg.AsyncConnection,
