@@ -60,6 +60,7 @@ Reconciler：全部 tuple ─> mapping ─> 期望狀態 ─┐
 model
   schema 1.1
 type user
+type column
 type group
   relations
     define member: [user]
@@ -72,6 +73,7 @@ type db_schema
 type db_table
   relations
     define reader: [group#member]
+    define row_column: [column]
 type row_set
   relations
     define table: [db_table]
@@ -79,6 +81,8 @@ type row_set
 ```
 
 `row_set#table` 只用來判斷 row_set 屬於哪張表（不靠解析物件 id），不參與權限計算。
+
+`db_table#row_column@column:<col>` 表示這張表宣告為列級受控、分區欄位是 `<col>`；每張表最多一筆（RuleService 保證）。宣告者與時間記在稽核（2026-10-18 決定，取代 SQLite 的 `row_policies`）。
 
 ### 2.3 映射表
 
@@ -89,13 +93,12 @@ type row_set
 | `db_table:c/s/t#reader@group:g#member` | `GRANT SELECT ON s.t TO g_g`；`row_grants(g_g, s, t, '*')` | 反向 |
 | `row_set:c/s/t/col=v#reader@group:g#member` | `row_grants(g_g, s, t, v)`（`s`、`t` 由 `table` 關係取得） | 刪除該筆 |
 | `row_set:...#table@db_table:...` | 無 | 無 |
+| `db_table:c/s/t#row_column@column:col` | 宣告列級受控：`ENABLE` + `FORCE ROW LEVEL SECURITY`、建立 `gw_passthrough` 與 `gw_read`、`GRANT SELECT ON s.t TO gw_managed` | 取消列級受控：`DROP POLICY` ×2、`NO FORCE` + `DISABLE ROW LEVEL SECURITY`、`REVOKE SELECT ON s.t FROM gw_managed` |
 | `gateway:main#admin@user:u` | 無（只更新 admin 快取） | 無 |
 
 不屬於任何 tuple、一次性的設定：
 
 - **目標 DB 設定（每個目標 DB，操作者手動執行）**：`GRANT USAGE ON SCHEMA <各 schema> TO gw_managed`；`paradedb` 的 `USAGE` 與函式 `EXECUTE` 授給 `gw_managed`。Reconciler 發現新 schema 缺 `USAGE` 時只回報，不自動補。
-- **宣告列級受控**（寫入 `row_policies`）：`ENABLE` + `FORCE ROW LEVEL SECURITY`、建立 `gw_passthrough` 與 `gw_read`、`GRANT SELECT ON s.t TO gw_managed`。
-- **取消列級受控**：`DROP POLICY` ×2、`NO FORCE` + `DISABLE ROW LEVEL SECURITY`、`REVOKE SELECT ON s.t FROM gw_managed`。
 
 `<owner>` 清單來自連線設定 `default_privilege_owners`。
 
@@ -116,10 +119,11 @@ type row_set
 | 檢查 | 原因 |
 |---|---|
 | 同一群組在同一 schema 不能同時有 `db_schema#reader` 與 `db_table#reader` | 兩者都 `GRANT SELECT` 同一張表，收回其中一個會連帶拿掉另一個。要從整個 schema 改成部分表，先刪 schema 規則再加表規則 |
-| `row_set` 只能建在列級受控表上，欄位必須是 `row_policies` 宣告的分區欄位 | 未受控的表上 row_set 不會生效 |
+| `row_set` 只能建在列級受控表上，欄位必須是 `db_table#row_column` 宣告的分區欄位 | 未受控的表上 row_set 不會生效 |
 | 寫入 row_set 的第一筆 reader 時一併寫入 `table` parent tuple；刪除最後一筆 reader 時一併刪除 | parent tuple 由各群組共用 |
 | 取消列級受控前，該表不能還有 row_set reader | 否則留下不會生效的規則 |
 | 分區欄位 distinct 數超過門檻（預設 200）時拒絕宣告 | 低基數限制（§13） |
+| 一張表只能有一筆 `row_column`；已宣告時再宣告（不論欄位）拒絕 | `gw_read` 只認一個欄位 |
 | 群組名稱、連線名稱建立後不可改 | 它們是 OpenFGA id 與 PG role 名的一部分 |
 
 檢查與寫入要在同一把 `asyncio.Lock`（全域，單一 process）內完成，避免兩個管理者同時寫入時都通過檢查。違反時回 409，訊息說明衝突的既有規則。
@@ -188,7 +192,7 @@ GRANT SELECT ON s.t TO gw_managed;
 
 ### 2.6 OpenFGA 物件 id
 
-- `user:<users.id>`、`group:<groups.name>`、`gateway:main`
+- `user:<users.id>`、`group:<groups.name>`、`gateway:main`、`column:<column>`
 - `db_schema:<conn>/<schema>`、`db_table:<conn>/<schema>/<table>`、`row_set:<conn>/<schema>/<table>/<column>=<value>`
 - `<conn>` 用 `connections.name`
 - 每段以 percent-encoding 跳脫 `/ = : # @ % 空白`；超過 OpenFGA 長度上限時拒絕寫入（低基數欄位不會碰到）
@@ -243,7 +247,7 @@ tests/
 
 | # | 項目 | 產出 | 驗證 |
 |---|---|---|---|
-| 1 | 專案骨架與 dev 環境 | uv 依賴（fastapi、psycopg[binary,pool]、openfga-sdk、pytest）、`docker-compose.yml`、SQLite migration（`groups`、`row_policies`、`sync_state` 與 M1 最小表） | `docker compose up` 後健康檢查通過 |
+| 1 | 專案骨架與 dev 環境 | uv 依賴（fastapi、psycopg[binary,pool]、openfga-sdk、pytest）、`docker-compose.yml`、SQLite migration（`groups`、`sync_state` 與 M1 最小表） | `docker compose up` 後健康檢查通過 |
 | 2 | OpenFGA 模型與 store | `model.fga`、`ids.py`、`PermissionStore` 兩種實作；啟動時比對 model，不同則寫入新版並記錄 model id | id round-trip；兩種實作跑同一組合約測試（write/delete/read/read_changes/check） |
 | 3 | 目標 DB 設定與檢查 | `docs/target-db-setup.md`（操作者手動執行的 SQL）、`targetdb/check.py`（唯讀檢查，回報缺什麼）：`gw_managed`、`gateway_acl`、函式、schema `USAGE` 與 `paradedb` 授權給 `gw_managed` | 照文件設定後檢查無問題；缺項時檢查逐項回報；一般 role 讀不到 `row_grants` |
 | 4 | 映射 | `mapping.py`、`pg_ops.py` | 2.3 每一列一個單元測試；`revoke_ops(t)` 套用在 `grant_ops(t)` 之後回到原狀；ops 重複套用結果不變 |
@@ -310,3 +314,10 @@ tests/
 - RLS 函式用 `pg_has_role(..., 'USAGE')` 並 join `pg_roles`：管理帳號以 CREATEROLE 建立 role 時得到的隱含 membership 不繼承權限，不會被當成受控使用者；`row_grants` 裡的孤兒資料（role 已不存在）會被忽略，不會讓查詢報錯
 - 群組與成員是全域的，同一個 cluster 上的多個連線共用 `g_*`、`u_*`，行為一致；群組底下還有規則時不可刪除
 - 重放時角色或物件不存在的 op 略過並記錄（規則見 `permissions/types.py`）；`DropGroupRole` 先刪該群組的 `row_grants` 再刪 role
+
+## 10. 已確認的決定（2026-10-18，W3 gate 後）
+
+- 列級受控的宣告改存 OpenFGA（`db_table#row_column@column:<col>`），刪除 SQLite 的 `row_policies`：權限相關的狀態只有 OpenFGA 一個來源，Syncer / Reconciler / 重放都照 tuple 處理，RLS 被手動關掉時 Reconciler 會像其他 drift 一樣修回
+- 宣告：RuleService 先以 executor 套用 `EnableRowPolicy`（有 op 被略過也算失敗），成功後才寫 tuple；寫 tuple 失敗時套用 `DisableRowPolicy` 撤回。取消宣告：先刪 tuple，再套用 `DisableRowPolicy`（失敗只記錄，Syncer 會再套用）
+- PG 上有 `gw_*` policy 但 OpenFGA 沒有對應宣告時，Reconciler 只回報，不自動移除
+- 由非管理帳號（例如 superuser 手動）授予的 membership，管理帳號撤不掉；Syncer 回報錯誤並註明需人工以 superuser 撤銷，不自動提權

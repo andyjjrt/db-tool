@@ -11,6 +11,12 @@ completes (including a PG step that failed after the SQLite/OpenFGA part was don
 call rejected by a check writes nothing. The ``detail`` JSON carries the action, its
 arguments, the tuples written and deleted and, on a PG failure, ``error``.
 
+Row control is declared in OpenFGA, which is its single source of truth: one
+``Tuple(column:<col>, row_column, db_table:<conn>/<schema>/<table>)`` per controlled
+table. A row_set exists iff its parent tuple ``db_table#table -> row_set`` exists;
+``RuleService`` maintains those parent tuples. Who enabled a table, and when, lives only
+in the audit log.
+
 Errors: ``RuleConflict`` (409), ``NotFound`` (404), ``AdminForbidden`` (403) and
 ``ValueError`` for invalid input (400).
 """
@@ -36,9 +42,16 @@ from db_gateway.permissions.admin import (
     ensure_can_remove_admin,
 )
 from db_gateway.permissions.executor_protocol import Executor
-from db_gateway.permissions.mapping import row_policy_disable_ops, row_policy_enable_ops
 from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStore, Tuple
-from db_gateway.permissions.types import ALL, CreateGroupRole, DropGroupRole, PgOp, group_role
+from db_gateway.permissions.types import (
+    ALL,
+    CreateGroupRole,
+    DisableRowPolicy,
+    DropGroupRole,
+    EnableRowPolicy,
+    PgOp,
+    group_role,
+)
 
 __all__ = [
     "AdminForbidden",
@@ -122,14 +135,15 @@ class RuleService:
             raise NotFound(f"user not found: {user_id}")
         return AdminUser(id=row[0], login_key=row[1])
 
-    async def _declared_column(self, connection_id: int, schema: str, table: str) -> str | None:
-        async with self._db.execute(
-            "SELECT column_name FROM row_policies "
-            "WHERE connection_id = ? AND schema_name = ? AND table_name = ?",
-            (connection_id, schema, table),
-        ) as cur:
-            row = await cur.fetchone()
-        return None if row is None else row[0]
+    async def _row_column_tuple(self, connection: str, schema: str, table: str) -> Tuple | None:
+        found = await self._store.read(
+            object=ids.db_table(connection, schema, table), relation="row_column"
+        )
+        return found[0] if found else None
+
+    async def _declared_column(self, connection: str, schema: str, table: str) -> str | None:
+        found = await self._row_column_tuple(connection, schema, table)
+        return None if found is None else ids.parse_column(found.user)
 
     async def _group_rules(self, group: str) -> list[Tuple]:
         """Every reader tuple held by the group (db_schema, db_table and row_set).
@@ -141,15 +155,10 @@ class RuleService:
         return [t for t in await self._store.read() if t.user == userset and t.relation == "reader"]
 
     async def _table_row_sets(self, connection: str, schema: str, table: str) -> list[Tuple]:
-        """Row_set reader tuples (any group) on one table."""
-        found = []
-        for t in await self._store.read():
-            if t.relation != "reader" or not t.object.startswith("row_set:"):
-                continue
-            ref = ids.parse_row_set(t.object)
-            if (ref.connection, ref.schema, ref.table) == (connection, schema, table):
-                found.append(t)
-        return found
+        """Parent tuples of the row_sets of one table; a row_set exists iff its parent does."""
+        return await self._store.read(
+            object="row_set:", user=ids.db_table(connection, schema, table)
+        )
 
     # --- writes --------------------------------------------------------------------
 
@@ -431,7 +440,7 @@ class RuleService:
         async with self._lock:
             await self._require_group(group)
             connection_id = await self._connection_id(connection)
-            declared = await self._declared_column(connection_id, schema, table)
+            declared = await self._declared_column(connection, schema, table)
             if declared is None:
                 raise RuleConflict(
                     f"{connection}/{schema}.{table} is not declared as row-controlled"
@@ -483,7 +492,7 @@ class RuleService:
         args = {"connection": connection, "schema": schema, "table": table, "column": column}
         async with self._lock:
             connection_id = await self._connection_id(connection)
-            declared = await self._declared_column(connection_id, schema, table)
+            declared = await self._declared_column(connection, schema, table)
             if declared is not None:
                 raise RuleConflict(
                     f"{connection}/{schema}.{table} is already row-controlled by column {declared}"
@@ -495,17 +504,10 @@ class RuleService:
                 raise RuleConflict(
                     f"column {column} has more than {self._distinct_limit} distinct values"
                 )
-            async with metadata.transaction(self._db):
-                await self._db.execute(
-                    "INSERT INTO row_policies "
-                    "(connection_id, schema_name, table_name, column_name, enabled_by, enabled_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (connection_id, schema, table, column, actor.id, metadata.now_iso()),
-                )
+            rule = Tuple(ids.column(column), "row_column", ids.db_table(connection, schema, table))
             try:
                 skipped = await self._executor.apply(
-                    connection,
-                    [t.op for t in row_policy_enable_ops(connection, schema, table, column)],
+                    connection, [EnableRowPolicy(schema, table, column)]
                 )
                 if skipped:
                     # The table, its schema or gw_managed is missing: nothing was enabled.
@@ -514,58 +516,70 @@ class RuleService:
                         "(table, schema or gw_managed missing)"
                     )
             except Exception as exc:
-                async with metadata.transaction(self._db):
-                    await self._db.execute(
-                        "DELETE FROM row_policies "
-                        "WHERE connection_id = ? AND schema_name = ? AND table_name = ?",
-                        (connection_id, schema, table),
-                    )
-                    await self._audit(
-                        actor,
-                        "declare_row_policy",
-                        args,
-                        connection_id,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                raise
-            await self._record(actor, "declare_row_policy", args, connection_id=connection_id)
-
-    async def undeclare_row_policy(
-        self, actor: AdminUser, connection: str, schema: str, table: str
-    ) -> None:
-        _no_wildcard("schema name", schema)
-        _no_wildcard("table name", table)
-        args = {"connection": connection, "schema": schema, "table": table}
-        async with self._lock:
-            connection_id = await self._connection_id(connection)
-            if await self._declared_column(connection_id, schema, table) is None:
-                raise NotFound(f"{connection}/{schema}.{table} is not row-controlled")
-            readers = await self._table_row_sets(connection, schema, table)
-            if readers:
-                held = ", ".join(sorted(f"{t.object}#{t.relation}" for t in readers))
-                raise RuleConflict(
-                    f"{connection}/{schema}.{table} still has row_set readers: {held}"
-                )
-            try:
-                await self._executor.apply(
-                    connection, [t.op for t in row_policy_disable_ops(connection, schema, table)]
-                )
-            except Exception as exc:
                 await self._record(
                     actor,
-                    "undeclare_row_policy",
+                    "declare_row_policy",
                     args,
                     connection_id=connection_id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 raise
-            async with metadata.transaction(self._db):
-                await self._db.execute(
-                    "DELETE FROM row_policies "
-                    "WHERE connection_id = ? AND schema_name = ? AND table_name = ?",
-                    (connection_id, schema, table),
+            try:
+                await self._write([rule])
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                try:
+                    if await self._executor.apply(connection, [DisableRowPolicy(schema, table)]):
+                        error += "; undo skipped: RLS may still be enabled"
+                except Exception as undo_exc:
+                    error += f"; undo failed: {type(undo_exc).__name__}: {undo_exc}"
+                await self._record(
+                    actor, "declare_row_policy", args, connection_id=connection_id, error=error
                 )
-                await self._audit(actor, "undeclare_row_policy", args, connection_id)
+                raise
+            await self._record(
+                actor, "declare_row_policy", args, connection_id=connection_id, written=[rule]
+            )
+
+    async def undeclare_row_policy(
+        self, actor: AdminUser, connection: str, schema: str, table: str
+    ) -> str | None:
+        """Remove the declaration; returns None, or the error if disabling RLS is pending.
+
+        The ``row_column`` tuple is deleted first and stays deleted when the PG step
+        fails or is skipped: the Syncer applies the same op from the change stream.
+        """
+        _no_wildcard("schema name", schema)
+        _no_wildcard("table name", table)
+        args = {"connection": connection, "schema": schema, "table": table}
+        async with self._lock:
+            connection_id = await self._connection_id(connection)
+            rule = await self._row_column_tuple(connection, schema, table)
+            if rule is None:
+                raise NotFound(f"{connection}/{schema}.{table} is not row-controlled")
+            readers = await self._table_row_sets(connection, schema, table)
+            if readers:
+                held = ", ".join(sorted(t.object for t in readers))
+                raise RuleConflict(
+                    f"{connection}/{schema}.{table} still has row_set readers: {held}"
+                )
+            await self._write(deletes=[rule])
+            error: str | None = None
+            try:
+                skipped = await self._executor.apply(connection, [DisableRowPolicy(schema, table)])
+                if skipped:
+                    error = f"{connection}/{schema}.{table}: row control was not disabled (skipped)"
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            await self._record(
+                actor,
+                "undeclare_row_policy",
+                args,
+                connection_id=connection_id,
+                deleted=[rule],
+                error=error,
+            )
+            return error
 
     # --- admins ----------------------------------------------------------------------
 

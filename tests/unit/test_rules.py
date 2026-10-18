@@ -12,7 +12,7 @@ from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.admin import AdminForbidden, AdminUser, admin_tuple
 from db_gateway.permissions.rules import NotFound, RuleConflict, RuleService
-from db_gateway.permissions.store import Tuple
+from db_gateway.permissions.store import PermissionStoreUnavailable, Tuple
 from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.types import (
     CreateGroupRole,
@@ -95,6 +95,19 @@ def svc(
     return RuleService(db, store, executor, stats, distinct_limit=10, initial_admins={"boss"})
 
 
+class FailingRowColumnStore(MemoryStore):
+    """MemoryStore whose write raises when it carries a row_column tuple."""
+
+    async def write(self, writes: Sequence[Tuple] = (), deletes: Sequence[Tuple] = ()) -> None:
+        if any(t.relation == "row_column" for t in writes):
+            raise PermissionStoreUnavailable("openfga down")
+        await super().write(writes, deletes)
+
+
+def row_column(column: str, table: str = "t") -> Tuple:
+    return Tuple(ids.column(column), "row_column", ids.db_table("prod", "public", table))
+
+
 async def audit_rows(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     async with db.execute(
         "SELECT kind, user_id, connection_id, error, detail FROM audit_log ORDER BY id"
@@ -158,7 +171,7 @@ async def test_row_set_on_wrong_column_conflicts(svc: RuleService) -> None:
 
 
 async def test_undeclare_with_row_set_readers_conflicts(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore
 ) -> None:
     await make_group(svc)
     await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
@@ -167,11 +180,13 @@ async def test_undeclare_with_row_set_readers_conflicts(
     with pytest.raises(RuleConflict, match="row_set readers"):
         await svc.undeclare_row_policy(INITIAL, "prod", "public", "t")
     assert executor.calls == []
-    assert await count(db, "row_policies") == 1
+    assert await store.read(ids.db_table("prod", "public", "t"), "row_column") == [
+        row_column("team")
+    ]
     await svc.revoke_row_set(INITIAL, "g1", "prod", "public", "t", "team", "a")
     await svc.undeclare_row_policy(INITIAL, "prod", "public", "t")
     assert executor.calls == [("prod", [DisableRowPolicy("public", "t")])]
-    assert await count(db, "row_policies") == 0
+    assert await store.read(ids.db_table("prod", "public", "t"), "row_column") == []
 
 
 async def test_undeclare_unknown_table_not_found(svc: RuleService) -> None:
@@ -180,14 +195,14 @@ async def test_undeclare_unknown_table_not_found(svc: RuleService) -> None:
 
 
 async def test_declare_over_distinct_limit_conflicts(
-    svc: RuleService, stats: FakeStats, executor: FakeExecutor, db: aiosqlite.Connection
+    svc: RuleService, stats: FakeStats, executor: FakeExecutor, store: MemoryStore
 ) -> None:
     stats.count = 11
     with pytest.raises(RuleConflict, match="more than 10"):
         await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
     assert stats.calls == [("prod", "public", "t", "team", 10)]
     assert executor.calls == []
-    assert await count(db, "row_policies") == 0
+    assert await store.read(ids.db_table("prod", "public", "t"), "row_column") == []
     stats.count = 10
     await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
 
@@ -297,24 +312,33 @@ async def test_row_set_parent_tuple_follows_first_and_last_reader(
 # --- declare / undeclare against the executor ----------------------------------------
 
 
-async def test_declare_success_keeps_row_and_enables_policy(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+async def test_declare_success_writes_tuple_and_enables_policy(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
     await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
     assert executor.calls == [("prod", [EnableRowPolicy("public", "t", "team")])]
-    async with db.execute(
-        "SELECT schema_name, table_name, column_name, enabled_by FROM row_policies"
-    ) as cur:
-        assert await cur.fetchall() == [("public", "t", "team", 1)]
+    assert await store.read(ids.db_table("prod", "public", "t"), "row_column") == [
+        row_column("team")
+    ]
+    (row,) = await audit_rows(db)
+    assert row["error"] is None
+    assert row["detail"]["action"] == "declare_row_policy"
+    assert row["detail"]["written"] == [
+        {
+            "user": "column:team",
+            "relation": "row_column",
+            "object": "db_table:prod/public/t",
+        }
+    ]
 
 
-async def test_declare_executor_failure_removes_row_and_audits(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+async def test_declare_executor_failure_writes_nothing_and_audits(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
     executor.fail_on = {"prod"}
     with pytest.raises(RuntimeError, match="boom"):
         await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
-    assert await count(db, "row_policies") == 0
+    assert await store.read() == []
     (row,) = await audit_rows(db)
     assert row["detail"]["action"] == "declare_row_policy"
     assert "boom" in row["error"]
@@ -323,28 +347,137 @@ async def test_declare_executor_failure_removes_row_and_audits(
     await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")  # can retry
 
 
-async def test_declare_skipped_by_executor_removes_row_and_audits(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+async def test_declare_skipped_by_executor_writes_nothing_and_audits(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
     executor.skip_all = True  # e.g. the table vanished after the distinct count
     with pytest.raises(NotFound, match="not enabled"):
         await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
-    assert await count(db, "row_policies") == 0
+    assert await store.read() == []
     (row,) = await audit_rows(db)
     assert "not enabled" in row["detail"]["error"]
 
 
-async def test_undeclare_executor_failure_keeps_row_and_audits(
-    svc: RuleService, executor: FakeExecutor, db: aiosqlite.Connection
+async def test_declare_store_failure_undoes_policy_and_audits(
+    db: aiosqlite.Connection, executor: FakeExecutor, stats: FakeStats
+) -> None:
+    store = FailingRowColumnStore()
+    svc = RuleService(db, store, executor, stats, distinct_limit=10, initial_admins={"boss"})
+    with pytest.raises(PermissionStoreUnavailable):
+        await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    assert executor.calls == [
+        ("prod", [EnableRowPolicy("public", "t", "team")]),
+        ("prod", [DisableRowPolicy("public", "t")]),
+    ]
+    assert await store.read() == []
+    (row,) = await audit_rows(db)
+    assert "openfga down" in row["error"]
+    assert "undo failed" not in row["error"]
+
+
+async def test_declare_store_failure_and_failed_undo_report_both(
+    db: aiosqlite.Connection, stats: FakeStats
+) -> None:
+    class UndoFails(FakeExecutor):
+        async def apply(self, connection: str, ops: Sequence[PgOp]) -> Sequence[PgOp]:
+            if isinstance(ops[0], DisableRowPolicy):
+                raise RuntimeError("undo boom")
+            return await super().apply(connection, ops)
+
+    svc = RuleService(
+        db, FailingRowColumnStore(), UndoFails(), stats, distinct_limit=10, initial_admins=set()
+    )
+    with pytest.raises(PermissionStoreUnavailable):
+        await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    (row,) = await audit_rows(db)
+    assert "openfga down" in row["error"]
+    assert "undo boom" in row["error"]
+
+
+async def test_declare_store_failure_and_skipped_undo_is_audited(
+    db: aiosqlite.Connection, stats: FakeStats
+) -> None:
+    class UndoSkipped(FakeExecutor):
+        async def apply(self, connection: str, ops: Sequence[PgOp]) -> Sequence[PgOp]:
+            await super().apply(connection, ops)
+            return list(ops) if isinstance(ops[0], DisableRowPolicy) else []
+
+    svc = RuleService(
+        db, FailingRowColumnStore(), UndoSkipped(), stats, distinct_limit=10, initial_admins=set()
+    )
+    with pytest.raises(PermissionStoreUnavailable):
+        await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    (row,) = await audit_rows(db)
+    assert "openfga down" in row["error"]
+    assert "undo skipped" in row["error"]
+
+
+async def test_redeclare_with_other_column_conflicts(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore
+) -> None:
+    await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    executor.calls.clear()
+    with pytest.raises(RuleConflict, match="already row-controlled by column team"):
+        await svc.declare_row_policy(INITIAL, "prod", "public", "t", "region")
+    assert executor.calls == []
+    assert await store.read(ids.db_table("prod", "public", "t"), "row_column") == [
+        row_column("team")
+    ]
+
+
+async def test_undeclare_success_deletes_tuple_and_disables_policy(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
+) -> None:
+    await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    executor.calls.clear()
+    assert await svc.undeclare_row_policy(INITIAL, "prod", "public", "t") is None
+    assert executor.calls == [("prod", [DisableRowPolicy("public", "t")])]
+    assert await store.read() == []
+    rows = await audit_rows(db)
+    assert rows[1]["error"] is None
+    assert rows[1]["detail"]["deleted"][0]["relation"] == "row_column"
+
+
+async def test_undeclare_executor_failure_keeps_delete_and_reports_pending(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
 ) -> None:
     await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
     executor.fail_on = {"prod"}
-    with pytest.raises(RuntimeError):
-        await svc.undeclare_row_policy(INITIAL, "prod", "public", "t")
-    assert await count(db, "row_policies") == 1
+    pending = await svc.undeclare_row_policy(INITIAL, "prod", "public", "t")
+    assert pending is not None
+    assert "boom" in pending
+    assert await store.read() == []
     rows = await audit_rows(db)
     assert len(rows) == 2
     assert "boom" in rows[1]["error"]
+
+
+async def test_undeclare_skipped_by_executor_reports_pending(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
+) -> None:
+    await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    executor.skip_all = True
+    assert await svc.undeclare_row_policy(INITIAL, "prod", "public", "t") is not None
+    assert await store.read() == []
+    assert (await audit_rows(db))[1]["error"] is not None
+
+
+async def test_undeclare_blocked_by_row_set_parent_tuple(
+    svc: RuleService, executor: FakeExecutor, store: MemoryStore, db: aiosqlite.Connection
+) -> None:
+    await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    parent = Tuple(
+        ids.db_table("prod", "public", "t"),
+        "table",
+        ids.row_set("prod", "public", "t", "team", "a"),
+    )
+    await store.write([parent])  # a row_set exists iff its parent tuple does
+    executor.calls.clear()
+    with pytest.raises(RuleConflict, match="row_set readers"):
+        await svc.undeclare_row_policy(INITIAL, "prod", "public", "t")
+    assert executor.calls == []
+    assert row_column("team") in await store.read()
+    assert len(await audit_rows(db)) == 1  # only the declare
 
 
 # --- groups on every connection --------------------------------------------------------

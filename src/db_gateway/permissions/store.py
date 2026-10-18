@@ -18,8 +18,8 @@ MAX_TUPLES_PER_WRITE = 100
 class Tuple:
     """One relationship tuple, in OpenFGA's string form.
 
-    user:     "user:12", "group:analysts#member", "db_table:prod/s/t"
-    relation: "member", "reader", "table", "admin"
+    user:     "user:12", "group:analysts#member", "db_table:prod/s/t", "column:team"
+    relation: "member", "reader", "table", "admin", "row_column"
     object:   "group:analysts", "db_table:prod/s/t", "row_set:prod/s/t/team=a"
     """
 

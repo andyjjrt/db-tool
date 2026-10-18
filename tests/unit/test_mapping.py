@@ -1,14 +1,9 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
 from db_gateway.permissions import ids
-from db_gateway.permissions.mapping import (
-    grant_ops,
-    revoke_ops,
-    row_policy_disable_ops,
-    row_policy_enable_ops,
-)
+from db_gateway.permissions.mapping import grant_ops, revoke_ops
 from db_gateway.permissions.store import Tuple
 from db_gateway.permissions.types import (
     ALL,
@@ -98,6 +93,20 @@ def test_table_reader_maps_table_select_and_row_grant() -> None:
     ]
 
 
+@pytest.mark.parametrize("column", ["team", 'team /:#@%="'])
+def test_row_column_maps_enable_and_disable_row_policy(column: str) -> None:
+    tuple_ = Tuple(
+        user=ids.column(column),
+        relation="row_column",
+        object=ids.db_table("c", "sales", "events"),
+    )
+
+    assert grant_ops(tuple_, _ctx()) == [
+        TargetedOp("c", EnableRowPolicy("sales", "events", column))
+    ]
+    assert revoke_ops(tuple_, _ctx()) == [TargetedOp("c", DisableRowPolicy("sales", "events"))]
+
+
 def test_row_set_reader_maps_exact_column_value() -> None:
     tuple_ = Tuple(
         user="group:analysts#member",
@@ -164,6 +173,11 @@ def test_revoke_ops_match_hand_written_expected_ops() -> None:
             ],
         ),
         (
+            Tuple("column:team", "row_column", "db_table:c/s/t"),
+            _ctx(),
+            [TargetedOp("c", DisableRowPolicy("s", "t"))],
+        ),
+        (
             Tuple("group:analysts#member", "reader", row_set_id),
             _ctx(),
             [TargetedOp("c", DeleteRowGrant(role, "sales", "events", "a"))],
@@ -220,10 +234,25 @@ def test_rejects_unknown_types_relations_and_connections() -> None:
         grant_ops(Tuple("group:g#member", "reader", "db_table:other/s/t"), _ctx())
 
 
-def test_row_policy_mapping_helpers() -> None:
-    assert row_policy_enable_ops("c", "sales", "events", "team") == [
-        TargetedOp("c", EnableRowPolicy("sales", "events", "team"))
-    ]
-    assert row_policy_disable_ops("c", "sales", "events") == [
-        TargetedOp("c", DisableRowPolicy("sales", "events"))
-    ]
+@pytest.mark.parametrize("mapping", [grant_ops, revoke_ops])
+@pytest.mark.parametrize(
+    "tuple_",
+    [
+        Tuple("column:team", "row_column", "db_table:other/s/t"),
+        Tuple("column:team", "row_column", "db_table:c/s/%2A"),
+        Tuple("column:%2A", "row_column", "db_table:c/s/t"),
+        Tuple("group:g#member", "row_column", "db_table:c/s/t"),
+        Tuple("user:12", "row_column", "db_table:c/s/t"),
+        Tuple("db_table:c/s/t", "row_column", "db_table:c/s/t"),
+        Tuple("team", "row_column", "db_table:c/s/t"),
+        Tuple("column:", "row_column", "db_table:c/s/t"),
+        Tuple("column:team/name", "row_column", "db_table:c/s/t"),
+        Tuple("column:team#member", "row_column", "db_table:c/s/t"),
+        Tuple("column:%74eam", "row_column", "db_table:c/s/t"),
+    ],
+)
+def test_row_column_rejects_invalid_tuples(
+    mapping: Callable[[Tuple, MappingContext], list[TargetedOp]], tuple_: Tuple
+) -> None:
+    with pytest.raises(ValueError):
+        mapping(tuple_, _ctx())

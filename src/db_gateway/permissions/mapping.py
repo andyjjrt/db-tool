@@ -47,6 +47,8 @@ def _inverse(op: PgOp) -> PgOp:
             return RevokeTableSelect(schema, table, role)
         case UpsertRowGrant(group_role=role, schema=schema, table=table, value=value):
             return DeleteRowGrant(role, schema, table, value)
+        case EnableRowPolicy(schema=schema, table=table):
+            return DisableRowPolicy(schema, table)
         case _:
             raise TypeError(f"no revoke operation for {type(op).__name__}")
 
@@ -93,6 +95,16 @@ def grant_ops(t: Tuple, ctx: MappingContext) -> list[TargetedOp]:
                 UpsertRowGrant(role, ref.schema, ref.table, ALL, ALL),
             ),
         ]
+
+    if object_type == "db_table" and t.relation == "row_column":
+        ref = ids.parse_db_table(t.object)
+        _check_connection(ref.connection, ctx)
+        if ref.table == ALL:
+            raise ValueError("'*' is not a legal table name")
+        column = ids.parse_column(t.user)
+        if column == ALL:
+            raise ValueError("'*' is not a legal column name")
+        return [TargetedOp(ref.connection, EnableRowPolicy(ref.schema, ref.table, column))]
 
     if object_type == "row_set":
         ref = ids.parse_row_set(t.object)
@@ -141,15 +153,3 @@ def revoke_ops(t: Tuple, ctx: MappingContext) -> list[TargetedOp]:
     """Return the inverse operations in reverse grant order."""
     grants = grant_ops(t, ctx)
     return [TargetedOp(target.connection, _inverse(target.op)) for target in reversed(grants)]
-
-
-def row_policy_enable_ops(
-    connection: str, schema: str, table: str, column: str
-) -> list[TargetedOp]:
-    """Return the operation that enables row-level filtering for a table."""
-    return [TargetedOp(connection, EnableRowPolicy(schema, table, column))]
-
-
-def row_policy_disable_ops(connection: str, schema: str, table: str) -> list[TargetedOp]:
-    """Return the operation that disables row-level filtering for a table."""
-    return [TargetedOp(connection, DisableRowPolicy(schema, table))]

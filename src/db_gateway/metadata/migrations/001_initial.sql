@@ -124,19 +124,6 @@ CREATE INDEX sessions_user_id ON sessions(user_id);
 CREATE INDEX sessions_activation_id ON sessions(activation_id);
 CREATE INDEX sessions_connection_id ON sessions(connection_id);
 
-CREATE TABLE row_policies (
-    id INTEGER PRIMARY KEY,
-    connection_id INTEGER NOT NULL REFERENCES connections(id),
-    schema_name TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    column_name TEXT NOT NULL,
-    enabled_by INTEGER NOT NULL REFERENCES users(id),
-    enabled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        CHECK (enabled_at GLOB
-        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
-    UNIQUE(connection_id, schema_name, table_name)
-);
-
 CREATE TABLE sync_state (
     consumer TEXT PRIMARY KEY NOT NULL,
     fga_store_id TEXT,

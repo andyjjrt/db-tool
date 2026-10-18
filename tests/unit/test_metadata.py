@@ -43,7 +43,6 @@ async def test_migration_idempotence_and_pragmas(conn: aiosqlite.Connection) -> 
             "groups",
             "connections",
             "sessions",
-            "row_policies",
             "sync_state",
             "audit_log",
         }
@@ -332,17 +331,6 @@ async def test_all_timestamp_columns_reject_noncanonical_values(
             "sessions",
             {"user_id": 1, "activation_id": 1, "connection_id": 1, "valid_until": valid},
             ("started_at", "valid_until", "last_seen_at", "ended_at"),
-        ),
-        (
-            "row_policies",
-            {
-                "connection_id": 1,
-                "schema_name": "public",
-                "table_name": "items",
-                "column_name": "team",
-                "enabled_by": 1,
-            },
-            ("enabled_at",),
         ),
         ("sync_state", {"consumer": "syncer"}, ("last_applied_at",)),
         ("audit_log", {"kind": "admin"}, ("ts",)),

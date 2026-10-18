@@ -5,6 +5,9 @@
       "type": "user"
     },
     {
+      "type": "column"
+    },
+    {
       "type": "group",
       "relations": {
         "member": {
@@ -67,6 +70,9 @@
       "relations": {
         "reader": {
           "this": {}
+        },
+        "row_column": {
+          "this": {}
         }
       },
       "metadata": {
@@ -76,6 +82,13 @@
               {
                 "type": "group",
                 "relation": "member"
+              }
+            ]
+          },
+          "row_column": {
+            "directly_related_user_types": [
+              {
+                "type": "column"
               }
             ]
           }

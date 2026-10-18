@@ -22,6 +22,16 @@ def test_table_schema_group_round_trip(value: str) -> None:
     assert ids.parse_db_schema(ids.db_schema(value, value)) == ids.SchemaRef(value, value)
     assert ids.parse_group(ids.group(value)) == value
     assert ids.parse_group(ids.group_member(value)) == value
+    assert ids.parse_column(ids.column(value)) == value
+    assert ids.column(value).count("/") == 0
+
+
+def test_column() -> None:
+    assert ids.column("team") == "column:team"
+    with pytest.raises(ValueError):
+        ids.parse_column("db_table:prod/s/t")
+    with pytest.raises(ValueError):
+        ids.parse_column("column:a b")
 
 
 def test_user() -> None:

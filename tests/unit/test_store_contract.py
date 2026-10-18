@@ -31,6 +31,23 @@ class StoreContract:
         await store.write(deletes=[item])
         assert await store.read(object=item.object) == []
 
+    async def test_row_column_tuple_round_trips_and_filters(self, store: PermissionStore) -> None:
+        row_column = Tuple(
+            user="column:team",
+            relation="row_column",
+            object="db_table:prod/sales/orders",
+        )
+        reader = Tuple(
+            user="group:analysts#member",
+            relation="reader",
+            object=row_column.object,
+        )
+        await store.write(writes=[row_column, reader])
+
+        assert set(await store.read()) == {row_column, reader}
+        assert set(await store.read(object=row_column.object)) == {row_column, reader}
+        assert await store.read(object=row_column.object, relation="row_column") == [row_column]
+
     async def test_write_rejects_conflicts_and_oversized_batches(
         self, store: PermissionStore
     ) -> None:

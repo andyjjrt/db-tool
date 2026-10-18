@@ -50,6 +50,11 @@ def group_member(name: str) -> str:
     return f"{group(name)}#member"
 
 
+def column(name: str) -> str:
+    """The user side of db_table#row_column: the table's declared partition column."""
+    return _check(f"column:{_enc(name)}")
+
+
 def db_schema(connection: str, schema: str) -> str:
     return _check(f"db_schema:{_enc(connection)}/{_enc(schema)}")
 
@@ -107,6 +112,13 @@ def parse_group(obj: str) -> str:
         body = body[: -len("#member")]
     if "#" in body:
         raise ValueError(f"unexpected relation in group id: {obj}")
+    return _dec(body)
+
+
+def parse_column(obj: str) -> str:
+    body = _split(obj, "column")
+    if "/" in body or "#" in body:
+        raise ValueError(f"malformed column id: {obj}")
     return _dec(body)
 
 
