@@ -206,10 +206,10 @@ class OpenFgaStore:
         if object is None:
             if relation is not None or user is not None:
                 raise ValueError("relation and user filters require an object")
-        elif not object or (object.endswith(":") and object != "row_set:"):
-            raise ValueError("only row_set: is supported as a type-only object filter")
-        elif object == "row_set:" and user is None:
-            raise ValueError("a user filter is required for row_set:")
+        elif not object or object == ":":
+            raise ValueError("empty object filter")
+        elif object.endswith(":") and user is None:
+            raise ValueError("a user filter is required with a type-only object filter")
 
         key = ReadRequestTupleKey(user=user, relation=relation, object=object)
         result: list[Tuple] = []

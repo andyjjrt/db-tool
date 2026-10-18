@@ -110,14 +110,17 @@ class MemoryStore:
         if object is None:
             if relation is not None or user is not None:
                 raise ValueError("relation and user filters require an object")
-        elif not object or (object.endswith(":") and object != "row_set:"):
-            raise ValueError("only row_set: is supported as a type-only object filter")
-        elif object == "row_set:" and user is None:
-            raise ValueError("a user filter is required for row_set:")
+        elif not object or object == ":":
+            raise ValueError("empty object filter")
+        elif object.endswith(":"):
+            if object[:-1] not in self._types:
+                raise ValueError(f"unknown type in object filter: {object}")
+            if user is None:
+                raise ValueError("a user filter is required with a type-only object filter")
 
         result = self._tuples
-        if object == "row_set:":
-            result = {item for item in result if item.object.startswith("row_set:")}
+        if object is not None and object.endswith(":"):
+            result = {item for item in result if item.object.startswith(object)}
         elif object is not None:
             result = {item for item in result if item.object == object}
         if relation is not None:

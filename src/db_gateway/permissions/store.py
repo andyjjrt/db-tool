@@ -79,7 +79,8 @@ class PermissionStore(Protocol):
         object:
           None                 every tuple in the store (relation and user must be None)
           "db_table:prod/s/t"  that object
-          "row_set:"           every object of that type; user is then required
+          "row_set:"           every object of that type ("group:", "db_table:", ...);
+                               user is then required
         Filter combinations outside these raise ValueError in every implementation.
         """
         ...

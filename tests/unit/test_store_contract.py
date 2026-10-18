@@ -128,6 +128,24 @@ class StoreContract:
             other_row_reader
         ]
 
+    async def test_read_by_type_and_user_for_any_type(self, store: PermissionStore) -> None:
+        memberships = {
+            Tuple(user="user:7", relation="member", object="group:a"),
+            Tuple(user="user:7", relation="member", object="group:b"),
+        }
+        other = Tuple(user="user:8", relation="member", object="group:a")
+        table_rule = Tuple(
+            user="group:a#member", relation="reader", object="db_table:prod/sales/orders"
+        )
+        schema_rule = Tuple(user="group:a#member", relation="reader", object="db_schema:prod/sales")
+        await store.write(writes=[*memberships, other, table_rule, schema_rule])
+
+        assert set(await store.read(object="group:", relation="member", user="user:7")) == (
+            memberships
+        )
+        assert await store.read(object="db_table:", user="group:a#member") == [table_rule]
+        assert await store.read(object="db_schema:", user="group:a#member") == [schema_rule]
+
     async def test_read_paginates_all_matching_tuples(self, store: PermissionStore) -> None:
         expected = {
             Tuple(user=f"user:{index}", relation="member", object=f"group:g{index}")
@@ -145,7 +163,8 @@ class StoreContract:
             (None, None, "user:1"),
             (None, "reader", "user:1"),
             ("row_set:", None, None),
-            ("db_table:", None, "user:1"),
+            ("db_table:", None, None),
+            ("group:", "member", None),
             ("", None, None),
         ]
         for object_filter, relation, user in invalid_filters:
