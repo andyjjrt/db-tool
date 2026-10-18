@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,9 +12,10 @@ class Settings(BaseSettings):
     openfga_api_url: str = "http://localhost:58080"
     openfga_store_id: str | None = None
     openfga_model_id: str | None = None
-    sync_poll_interval_s: float = 2.0
-    reconcile_interval_s: float = 600.0
-    revoke_sync_timeout_s: float = 5.0
+    sync_poll_interval_s: float = Field(default=2.0, gt=0)
+    reconcile_interval_s: float = Field(default=600.0, gt=0)
+    revoke_sync_timeout_s: float = Field(default=5.0, ge=0)
+    target_connect_timeout_s: int = Field(default=5, gt=0)
 
 
 @lru_cache

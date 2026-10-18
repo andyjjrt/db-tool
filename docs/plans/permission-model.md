@@ -169,8 +169,8 @@ ALTER TABLE s.t ENABLE ROW LEVEL SECURITY;
 ALTER TABLE s.t FORCE ROW LEVEL SECURITY;
 CREATE POLICY gw_passthrough ON s.t USING (NOT (SELECT gateway_acl.is_managed()));
 CREATE POLICY gw_read ON s.t FOR SELECT
-  USING ((SELECT gateway_acl.allow_all('s', 't'))
-         OR team::text = ANY ((SELECT gateway_acl.allowed_values('s', 't'))::text[]));
+  USING ((SELECT (SELECT gateway_acl.allow_all('s', 't'))
+                 OR team::text = ANY ((SELECT gateway_acl.allowed_values('s', 't'))::text[])));
 GRANT SELECT ON s.t TO gw_managed;
 ```
 
@@ -188,6 +188,7 @@ GRANT SELECT ON s.t TO gw_managed;
 注意：
 
 - `ANY` 裡的子查詢必須加 `::text[]`，否則會被當成 `ANY (subquery)` 而報 `text = text[]` 錯誤
+- `gw_read` 外層多包一個 scalar `SELECT`，讓欄位參照變成 correlated SubPlan：沒包的話 ParadeDB 0.26 在受控表上不走自己的 custom scan，`paradedb.score()` 會報 `FeatureNotSupported`（2026-10-18 驗收時發現）。看到的列不變；舊寫法的 policy 會被 Reconciler 視為 drift 重建
 - `gw_read` 不加 `TO gw_managed`：加了的話，使用者 `SET ROLE` 成群組 role 後會變 0 列
 - 函式 `EXECUTE` 保留給 PUBLIC：passthrough 需要每個 role 都能執行，`session_user` 讓它們只回傳呼叫者自己的結果
 - 啟用 RLS 與表權限的 `GRANT`/`REVOKE` 都需要 table owner（或 grant option）。每個連線的管理帳號是該 DB 的 owner，也可能是 superuser，所有 op 都直接以它執行，不 `SET ROLE`。權限不足時 op 失敗並回報，不自動補權限（2026-10-17 決定）

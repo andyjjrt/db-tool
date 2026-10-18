@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from typing import Any
 
 import aiosqlite
@@ -12,7 +12,9 @@ import pytest
 from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.admin import AdminForbidden, AdminUser, admin_tuple
+from db_gateway.permissions.ids import InvalidInput
 from db_gateway.permissions.rules import GroupInfo, NotFound, RuleConflict, RuleService
+from db_gateway.permissions.scan import UnsafeView
 from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStoreUnavailable, Tuple
 from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.types import (
@@ -126,6 +128,122 @@ async def count(db: aiosqlite.Connection, table: str) -> int:
 
 async def make_group(svc: RuleService, name: str = "g1") -> None:
     await svc.create_group(INITIAL, name, None)
+
+
+@pytest.mark.parametrize(
+    "object_id",
+    [
+        "bogus:x",
+        "group:",
+        "group:a#other",
+        "db_table:prod/s",
+        "column:%FF",
+        "user:-1",
+    ],
+)
+async def test_description_validation_raises_domain_invalid_input(
+    svc: RuleService,
+    object_id: str,
+) -> None:
+    with pytest.raises(InvalidInput):
+        await svc.set_description(INITIAL, object_id, "text")
+
+
+async def test_invalid_group_and_wildcard_raise_domain_invalid_input(svc: RuleService) -> None:
+    with pytest.raises(InvalidInput):
+        await svc.create_group(INITIAL, "bad name")
+    with pytest.raises(InvalidInput):
+        await svc.grant_schema_reader(INITIAL, "g1", "prod", "*")
+
+
+class FakeScanner:
+    def __init__(self, views: list[UnsafeView]) -> None:
+        self.views = views
+        self.calls: list[tuple[str, set[tuple[str, str]]]] = []
+
+    async def unsafe_views(
+        self, connection: str, tables: Collection[tuple[str, str]]
+    ) -> list[UnsafeView]:
+        self.calls.append((connection, set(tables)))
+        return self.views
+
+
+UNSAFE = UnsafeView("public", "leak", "view", "postgres", (("public", "t"),), "bypass_owner")
+
+
+@pytest.mark.parametrize("grant", ["table", "schema"])
+async def test_scanner_refuses_unsafe_reader_without_writes(
+    svc: RuleService, store: MemoryStore, db: aiosqlite.Connection, grant: str
+) -> None:
+    await make_group(svc)
+    await store.write(
+        [
+            row_column("team"),
+            Tuple(ids.column("team"), "row_column", ids.db_table("dev", "public", "excluded")),
+        ]
+    )
+    scanner = FakeScanner([UNSAFE])
+    svc._scanner = scanner
+    before = await store.read()
+    audits = await count(db, "audit_log")
+    with pytest.raises(RuleConflict, match=r"public.leak.*bypass_owner") as raised:
+        if grant == "table":
+            await svc.grant_table_reader(INITIAL, "g1", "prod", "public", "leak")
+        else:
+            await svc.grant_schema_reader(INITIAL, "g1", "prod", "public")
+    assert raised.value.conflicts[0]["reason"] == "bypass_owner"
+    assert scanner.calls == [("prod", {("public", "t")})]
+    assert await store.read() == before
+    assert await count(db, "audit_log") == audits
+
+
+@pytest.mark.parametrize("reader", ["table", "schema"])
+async def test_scanner_refuses_declaration_with_existing_unsafe_readers_before_apply(
+    svc: RuleService,
+    store: MemoryStore,
+    executor: FakeExecutor,
+    stats: FakeStats,
+    db: aiosqlite.Connection,
+    reader: str,
+) -> None:
+    await make_group(svc)
+    if reader == "table":
+        await svc.grant_table_reader(INITIAL, "g1", "prod", "public", "leak")
+    else:
+        await svc.grant_schema_reader(INITIAL, "g1", "prod", "public")
+    await store.write([row_column("team", "other")])
+    scanner = FakeScanner([UNSAFE])
+    svc._scanner = scanner
+    before = await store.read()
+    audits = await count(db, "audit_log")
+    with pytest.raises(RuleConflict, match="public.leak") as raised:
+        await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    assert len(raised.value.conflicts) == 2  # view and conflicting reader tuple
+    assert scanner.calls == [("prod", {("public", "other"), ("public", "t")})]
+    assert executor.calls == [] and stats.calls == []
+    assert await store.read() == before
+    assert await count(db, "audit_log") == audits
+
+
+async def test_scanner_allows_unread_unsafe_views_and_unrelated_grants(
+    svc: RuleService, store: MemoryStore
+) -> None:
+    await make_group(svc)
+    scanner = FakeScanner([UNSAFE])
+    svc._scanner = scanner
+    await svc.grant_table_reader(INITIAL, "g1", "prod", "public", "safe")
+    await svc.grant_schema_reader(INITIAL, "g1", "prod", "other")
+    await svc.declare_row_policy(INITIAL, "prod", "public", "t", "team")
+    assert row_column("team") in await store.read()
+    assert scanner.calls[-1] == ("prod", {("public", "t")})
+
+
+async def test_remove_nonadmin_is_not_found_and_not_audited(
+    svc: RuleService, db: aiosqlite.Connection
+) -> None:
+    with pytest.raises(NotFound, match="not an admin"):
+        await svc.remove_admin(INITIAL, PLAIN.id)
+    assert await count(db, "audit_log") == 0
 
 
 # --- §2.4 checks -------------------------------------------------------------------

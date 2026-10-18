@@ -14,6 +14,7 @@ server.
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -21,11 +22,54 @@ import aiosqlite
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from db_gateway.permissions.executor import ApplyError
 from db_gateway.permissions.types import MappingContext
 from db_gateway.secrets import SecretLookup, get_secret
 
 # Keys a credentials secret may set; anything else is a ValueError.
 SECRET_KEYS = frozenset({"user", "password", "passfile", "sslcert", "sslkey", "sslrootcert"})
+logger = logging.getLogger(__name__)
+
+
+class TargetUnavailable(Exception):
+    """Connection acquisition failed; diagnostics never contain server or secret text."""
+
+    def __init__(
+        self,
+        connection: str,
+        reason: str = "connect failed",
+        original: Exception | None = None,
+    ) -> None:
+        self.connection = connection
+        self.reason = reason
+        self.error = type(original).__name__ if original is not None else None
+        self.sqlstate = getattr(original, "sqlstate", None)
+        detail = f"target {connection} unreachable: {reason}"
+        if original is not None:
+            detail += f" ({self.error}, sqlstate={self.sqlstate})"
+        super().__init__(detail)
+
+
+class TargetQueryFailed(Exception):
+    """Safe query-time failure, distinct from a connection acquisition failure."""
+
+    def __init__(self, connection: str, original: psycopg.OperationalError) -> None:
+        self.connection = connection
+        self.error = type(original).__name__
+        self.sqlstate = original.sqlstate
+        super().__init__(f"target {connection} query failed")
+        logger.warning("%s: %s sqlstate=%s", self, self.error, self.sqlstate)
+
+
+def safe_error(exc: Exception) -> str:
+    """Keep database error classes and SQLSTATE, never their server message text."""
+    if isinstance(exc, ApplyError):
+        return f"{type(exc).__name__}: {safe_error(exc.original)}"
+    if isinstance(exc, psycopg.Error):
+        return f"{type(exc).__name__}: sqlstate={exc.sqlstate}"
+    if isinstance(exc, TargetQueryFailed):
+        return f"{exc}: {exc.error} sqlstate={exc.sqlstate}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 class ConnectionLocks:
@@ -119,7 +163,10 @@ def admin_conninfo(info: ConnectionInfo, secrets: SecretLookup = get_secret) -> 
 
 
 def admin_connector(
-    db: aiosqlite.Connection, secrets: SecretLookup = get_secret
+    db: aiosqlite.Connection,
+    secrets: SecretLookup = get_secret,
+    *,
+    connect_timeout_s: int = 5,
 ) -> Callable[[str], Awaitable[psycopg.AsyncConnection]]:
     """``connect(name)`` for PgExecutor: a fresh autocommit-off admin connection.
 
@@ -128,7 +175,30 @@ def admin_connector(
     """
 
     async def connect(name: str) -> psycopg.AsyncConnection:
-        info = await load_connection(db, name)
-        return await psycopg.AsyncConnection.connect(admin_conninfo(info, secrets))
+        try:
+            info = await load_connection(db, name)
+        except KeyError as exc:
+            error = TargetUnavailable(name, "connection not registered", exc)
+            logger.warning("%s", error)
+            raise error from None
+        try:
+            conninfo = admin_conninfo(info, secrets)
+        except (KeyError, ValueError, psycopg.ProgrammingError) as exc:
+            error = TargetUnavailable(name, "secret missing or invalid", exc)
+            logger.warning("%s", error)
+            raise error from None
+        try:
+            return await psycopg.AsyncConnection.connect(
+                conninfo, connect_timeout=connect_timeout_s
+            )
+        except psycopg.Error as exc:
+            reason = (
+                "credentials invalid"
+                if exc.sqlstate is not None and exc.sqlstate.startswith("28")
+                else "connect failed"
+            )
+            error = TargetUnavailable(name, reason, exc)
+            logger.warning("%s", error)
+            raise error from None
 
     return connect

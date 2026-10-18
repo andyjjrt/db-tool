@@ -23,12 +23,12 @@ in the audit log. Groups exist only through ``gateway:main#group@group:<name>``;
 SQLite descriptions are display-only, and group roles follow the tuple change stream.
 
 Errors: ``RuleConflict`` (409), ``NotFound`` (404), ``AdminForbidden`` (403) and
-``ValueError`` for invalid input (400).
+``InvalidInput`` for invalid input (422).
 """
 
 import asyncio
 import re
-from collections.abc import Sequence, Set
+from collections.abc import Collection, Sequence, Set
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
@@ -46,8 +46,11 @@ from db_gateway.permissions.admin import (
     ensure_can_add_admin,
     ensure_can_remove_admin,
 )
-from db_gateway.permissions.context import ConnectionLocks
+from db_gateway.permissions.context import ConnectionLocks, TargetUnavailable, safe_error
+from db_gateway.permissions.executor import ApplyError
 from db_gateway.permissions.executor_protocol import Executor
+from db_gateway.permissions.ids import InvalidInput
+from db_gateway.permissions.scan import UnsafeView
 from db_gateway.permissions.store import MAX_TUPLES_PER_WRITE, PermissionStore, Tuple
 from db_gateway.permissions.types import (
     ALL,
@@ -62,6 +65,7 @@ __all__ = [
     "PartitionStats",
     "RuleConflict",
     "RuleService",
+    "TargetUnavailable",
 ]
 
 _GROUP_NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
@@ -69,6 +73,10 @@ _GROUP_NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
 
 class RuleConflict(Exception):
     """The write conflicts with an existing rule or state; the API maps it to 409."""
+
+    def __init__(self, message: str, conflicts: Sequence[Tuple | UnsafeView] = ()) -> None:
+        super().__init__(message)
+        self.conflicts = [asdict(item) for item in conflicts]
 
 
 class NotFound(Exception):
@@ -89,13 +97,44 @@ class PartitionStats(Protocol):
         ...
 
 
+class Scanner(Protocol):
+    async def unsafe_views(
+        self, connection: str, tables: Collection[tuple[str, str]]
+    ) -> list[UnsafeView]: ...
+
+
+def controlled_tables(tuples: Collection[Tuple], connection: str) -> set[tuple[str, str]]:
+    tables = set()
+    for rule in tuples:
+        if rule.relation == "row_column" and rule.object.startswith("db_table:"):
+            ref = ids.parse_db_table(rule.object)
+            if ref.connection == connection:
+                tables.add((ref.schema, ref.table))
+    return tables
+
+
+def readable_rules(view: UnsafeView, tuples: Collection[Tuple], connection: str) -> list[Tuple]:
+    objects = {
+        ids.db_table(connection, view.schema, view.name),
+        ids.db_schema(connection, view.schema),
+    }
+    return [
+        rule
+        for rule in tuples
+        if rule.relation == "reader"
+        and rule.object in objects
+        and rule.user.startswith("group:")
+        and rule.user.endswith("#member")
+    ]
+
+
 class InlineRevoker(Protocol):
     async def apply_inline(self, deletes: Sequence[Tuple], timeout_s: float) -> bool: ...
 
 
 def _no_wildcard(what: str, value: str) -> None:
     if value == ALL:
-        raise ValueError(f"'*' is not a legal {what}")
+        raise InvalidInput(f"'*' is not a legal {what}")
 
 
 def _tuples(items: Sequence[Tuple]) -> list[dict[str, str]]:
@@ -115,6 +154,7 @@ class RuleService:
         inline: InlineRevoker | None = None,
         revoke_timeout_s: float = 5.0,
         locks: ConnectionLocks | None = None,
+        scanner: Scanner | None = None,
     ) -> None:
         self._db = db
         self._store = store
@@ -126,6 +166,7 @@ class RuleService:
         self._revoke_timeout = revoke_timeout_s
         self._lock = asyncio.Lock()
         self._locks = locks if locks is not None else ConnectionLocks()
+        self._scanner = scanner
 
     # --- lookups -------------------------------------------------------------------
 
@@ -174,6 +215,22 @@ class RuleService:
             object="row_set:", user=ids.db_table(connection, schema, table)
         )
 
+    async def _unsafe_views(
+        self, connection: str, *, declaring: tuple[str, str] | None = None
+    ) -> tuple[list[UnsafeView], list[Tuple]]:
+        if self._scanner is None:
+            return [], []
+        tuples = await self._store.read()
+        tables = controlled_tables(tuples, connection)
+        if declaring is not None:
+            tables.add(declaring)
+        return await self._scanner.unsafe_views(connection, tables), tuples
+
+    def _refuse_unsafe(self, views: Sequence[UnsafeView], rules: Sequence[Tuple] = ()) -> None:
+        if views:
+            names = ", ".join(f"{v.schema}.{v.name} ({v.reason})" for v in views)
+            raise RuleConflict(f"unsafe relations: {names}", [*views, *rules])
+
     # --- writes --------------------------------------------------------------------
 
     async def _inline_revoke(self, deleted: Sequence[Tuple]) -> str:
@@ -190,7 +247,7 @@ class RuleService:
             await self._store.write(writes, deletes)
             return
         if writes:
-            raise ValueError("too many tuples in one write")
+            raise InvalidInput("too many tuples in one write")
         for i in range(0, len(deletes), MAX_TUPLES_PER_WRITE):
             await self._store.write((), deletes[i : i + MAX_TUPLES_PER_WRITE])
 
@@ -250,11 +307,11 @@ class RuleService:
     ) -> None:
         """Create the group tuple; the Syncer creates its role on every connection."""
         if not _GROUP_NAME.fullmatch(name):
-            raise ValueError(f"invalid group name: {name!r}")
+            raise InvalidInput(f"invalid group name: {name!r}")
         async with self._lock:
             rule = ids.group_tuple(name)
             if await self._store.read(rule.object, rule.relation, rule.user):
-                raise RuleConflict(f"group already exists: {name}")
+                raise RuleConflict(f"group already exists: {name}", [rule])
             await self._write([rule])
             async with metadata.transaction(self._db):
                 if description is not None:
@@ -284,7 +341,7 @@ class RuleService:
     ) -> None:
         """Set display-only text for an OpenFGA object, or remove it with None."""
         if len(object_id) > ids.MAX_OBJECT_LEN or "#" in object_id:
-            raise ValueError(f"invalid object id: {object_id!r}")
+            raise InvalidInput(f"invalid object id: {object_id!r}")
         match object_id.partition(":")[0]:
             case "user":
                 ids.parse_user(object_id)
@@ -294,7 +351,7 @@ class RuleService:
                 ids.parse_column(object_id)
             case "gateway":
                 if object_id != ids.GATEWAY_MAIN:
-                    raise ValueError(f"invalid gateway id: {object_id!r}")
+                    raise InvalidInput(f"invalid gateway id: {object_id!r}")
             case "db_schema":
                 ids.parse_db_schema(object_id)
             case "db_table":
@@ -302,7 +359,7 @@ class RuleService:
             case "row_set":
                 ids.parse_row_set(object_id)
             case _:
-                raise ValueError(f"unknown object type: {object_id!r}")
+                raise InvalidInput(f"unknown object type: {object_id!r}")
         async with self._lock:
             async with metadata.transaction(self._db):
                 await self._set_description(object_id, description)
@@ -330,7 +387,7 @@ class RuleService:
             rules = await self._group_rules(name)
             if rules:
                 held = ", ".join(f"{t.object}#{t.relation}" for t in rules)
-                raise RuleConflict(f"group {name} still has rules: {held}")
+                raise RuleConflict(f"group {name} still has rules: {held}", rules)
             members = await self._store.read(ids.group(name), "member")
             deleted = [*members, ids.group_tuple(name)]
             # Batch members first; only the final batch removes group existence.
@@ -394,8 +451,11 @@ class RuleService:
                     if (ref.connection, ref.schema) == (connection, schema):
                         raise RuleConflict(
                             f"group {group} already reads table {ref.table} in "
-                            f"{connection}/{schema}; remove the table rules first"
+                            f"{connection}/{schema}; remove the table rules first",
+                            [t],
                         )
+            views, _ = await self._unsafe_views(connection)
+            self._refuse_unsafe([v for v in views if v.schema == schema])
             rule = Tuple(ids.group_member(group), "reader", ids.db_schema(connection, schema))
             await self._write([rule])
             await self._record(
@@ -438,8 +498,11 @@ class RuleService:
             if schema_rule in await self._group_rules(group):
                 raise RuleConflict(
                     f"group {group} already reads the whole schema {connection}/{schema}; "
-                    "remove the schema rule first"
+                    "remove the schema rule first",
+                    [schema_rule],
                 )
+            views, _ = await self._unsafe_views(connection)
+            self._refuse_unsafe([v for v in views if (v.schema, v.name) == (schema, table)])
             rule = Tuple(ids.group_member(group), "reader", ids.db_table(connection, schema, table))
             await self._write([rule])
             await self._record(
@@ -523,7 +586,14 @@ class RuleService:
             if declared != column:
                 raise RuleConflict(
                     f"{connection}/{schema}.{table} is row-controlled by column {declared}, "
-                    f"not {column}"
+                    f"not {column}",
+                    [
+                        Tuple(
+                            ids.column(declared),
+                            "row_column",
+                            ids.db_table(connection, schema, table),
+                        )
+                    ],
                 )
             set_id = ids.row_set(connection, schema, table, column, value)
             rule = Tuple(ids.group_member(group), "reader", set_id)
@@ -566,13 +636,25 @@ class RuleService:
         _no_wildcard("table name", table)
         _no_wildcard("row_set column", column)
         args = {"connection": connection, "schema": schema, "table": table, "column": column}
-        async with self._lock:
+        async with self._lock, self._locks(connection):
             connection_id = await self._connection_id(connection)
             declared = await self._declared_column(connection, schema, table)
             if declared is not None:
                 raise RuleConflict(
-                    f"{connection}/{schema}.{table} is already row-controlled by column {declared}"
+                    f"{connection}/{schema}.{table} is already row-controlled by column {declared}",
+                    [
+                        Tuple(
+                            ids.column(declared),
+                            "row_column",
+                            ids.db_table(connection, schema, table),
+                        )
+                    ],
                 )
+            views, tuples = await self._unsafe_views(connection, declaring=(schema, table))
+            exposed = [v for v in views if readable_rules(v, tuples, connection)]
+            self._refuse_unsafe(
+                exposed, [rule for v in exposed for rule in readable_rules(v, tuples, connection)]
+            )
             distinct = await self._stats.distinct_count(
                 connection, schema, table, column, self._distinct_limit
             )
@@ -597,8 +679,10 @@ class RuleService:
                     "declare_row_policy",
                     args,
                     connection_id=connection_id,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=safe_error(exc),
                 )
+                if isinstance(exc, ApplyError) and isinstance(exc.original, TargetUnavailable):
+                    raise exc.original from None
                 raise
             try:
                 await self._write([rule])
@@ -608,7 +692,7 @@ class RuleService:
                     if await self._executor.apply(connection, [DisableRowPolicy(schema, table)]):
                         error += "; undo skipped: RLS may still be enabled"
                 except Exception as undo_exc:
-                    error += f"; undo failed: {type(undo_exc).__name__}: {undo_exc}"
+                    error += f"; undo failed: {safe_error(undo_exc)}"
                 await self._record(
                     actor, "declare_row_policy", args, connection_id=connection_id, error=error
                 )
@@ -628,7 +712,7 @@ class RuleService:
         _no_wildcard("schema name", schema)
         _no_wildcard("table name", table)
         args = {"connection": connection, "schema": schema, "table": table}
-        async with self._lock:
+        async with self._lock, self._locks(connection):
             connection_id = await self._connection_id(connection)
             rule = await self._row_column_tuple(connection, schema, table)
             if rule is None:
@@ -637,7 +721,7 @@ class RuleService:
             if readers:
                 held = ", ".join(sorted(t.object for t in readers))
                 raise RuleConflict(
-                    f"{connection}/{schema}.{table} still has row_set readers: {held}"
+                    f"{connection}/{schema}.{table} still has row_set readers: {held}", readers
                 )
             await self._write(deletes=[rule])
             error: str | None = None
@@ -646,7 +730,7 @@ class RuleService:
                 if skipped:
                     error = f"{connection}/{schema}.{table}: row control was not disabled (skipped)"
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                error = safe_error(exc)
             await self._record(
                 actor,
                 "undeclare_row_policy",
@@ -673,5 +757,7 @@ class RuleService:
             target = await self._user(user_id)
             ensure_can_remove_admin(actor, target, self._initial_admins)
             rule = admin_tuple(user_id)
+            if not await self._store.read(rule.object, rule.relation, rule.user):
+                raise NotFound(f"user is not an admin: {user_id}")
             await self._write(deletes=[rule])
             await self._record(actor, "remove_admin", {"user_id": user_id}, deleted=[rule])

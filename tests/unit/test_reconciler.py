@@ -11,7 +11,7 @@ import pytest
 from db_gateway import metadata
 from db_gateway.permissions import ids
 from db_gateway.permissions.actual import ActualState, RowPolicy
-from db_gateway.permissions.context import ConnectionLocks
+from db_gateway.permissions.context import ConnectionLocks, safe_error
 from db_gateway.permissions.executor import ApplyError, TransientApplyError
 from db_gateway.permissions.reconciler import (
     ReconcileFailed,
@@ -19,8 +19,11 @@ from db_gateway.permissions.reconciler import (
     ReconcileReport,
     diff,
     expected_ops,
+    exposure_drift,
     policy_ok,
 )
+from db_gateway.permissions.rules import TargetUnavailable
+from db_gateway.permissions.scan import DefinerFunction, UnsafeView
 from db_gateway.permissions.store import Tuple
 from db_gateway.permissions.store_memory import MemoryStore
 from db_gateway.permissions.types import (
@@ -60,9 +63,9 @@ READ = RowPolicy(
     "r",
     True,
     ("PUBLIC",),
-    "(( SELECT gateway_acl.allow_all('s'::name, 't'::name) AS allow_all) OR (team = "
+    "( SELECT (( SELECT gateway_acl.allow_all('s'::name, 't'::name) AS allow_all) OR (t.team = "
     "ANY (( SELECT gateway_acl.allowed_values('s'::name, 't'::name) AS allowed_values)"
-    "::text[])))",
+    "::text[]))))",
     None,
 )
 
@@ -109,6 +112,32 @@ def run(
 
 def kinds(reported: list) -> set[str]:
     return {d.kind for d in reported}
+
+
+@pytest.mark.parametrize("source", ["table_rule", "schema_rule", "actual_grant", "unread"])
+def test_exposure_drift_only_reports_readable_unsafe_views(source: str) -> None:
+    view = UnsafeView("s", "t", "view", "postgres", (("s", "base"),), "bypass_owner")
+    rules = {
+        "table_rule": [TABLE_RULE],
+        "schema_rule": [SCHEMA_RULE],
+        "actual_grant": [],
+        "unread": [Tuple(ids.group_member("a"), "reader", ids.db_table("dev", "s", "t"))],
+    }[source]
+    actual = state(table_select={("s", "t", "g_a")} if source == "actual_grant" else set())
+    findings = exposure_drift("prod", rules, actual, [view], [])
+    assert kinds(findings) == (set() if source == "unread" else {"unsafe_view"})
+    assert actual.table_select == (
+        frozenset({("s", "t", "g_a")}) if source == "actual_grant" else frozenset()
+    )
+
+
+@pytest.mark.parametrize("bypass, executable", [(True, True), (True, False), (False, True)])
+def test_exposure_drift_only_reports_executable_bypass_definers(
+    bypass: bool, executable: bool
+) -> None:
+    function = DefinerFunction("s", "f", "arg integer", "owner", executable, bypass)
+    findings = exposure_drift("prod", [], state(), [], [function])
+    assert kinds(findings) == ({"definer_function"} if bypass and executable else set())
 
 
 SCHEMA_RULE = Tuple(ids.group_member("a"), "reader", ids.db_schema("prod", "s"))
@@ -279,7 +308,9 @@ def test_policy_ok_requires_the_complete_expression() -> None:
     assert policy_ok(READ, "gw_read", op, column_type="text")
     for using in (
         (READ.using or "")[:-1] + " OR true)",
-        (READ.using or "").replace("(team =", "(team <> 'x' OR team ="),
+        (READ.using or "").replace("(t.team =", "(t.team <> 'x' OR t.team ="),
+        # the pre-W5 shape without the outer sub-select: re-applied so ParadeDB scoring works
+        (READ.using or "")[len("( SELECT ") : -1].replace("t.team", "team"),
     ):
         assert not policy_ok(replace(READ, using=using), "gw_read", op, column_type="text")
     altered = "NOT (SELECT gateway_acl.is_managed() UNION SELECT false ORDER BY 1 LIMIT 1)"
@@ -292,7 +323,7 @@ def test_policy_ok_requires_the_complete_expression() -> None:
     assert not policy_ok(replace(READ, permissive=False), "gw_read", op, column_type="text")
     assert not policy_ok(replace(READ, with_check="true"), "gw_read", op, column_type="text")
     assert not policy_ok(replace(READ, roles=("someone",)), "gw_read", op, column_type="text")
-    shadowed = (READ.using or "").replace("(team =", "(team OPERATOR(public.=)")
+    shadowed = (READ.using or "").replace("(t.team =", "(t.team OPERATOR(public.=)")
     assert not policy_ok(replace(READ, using=shadowed), "gw_read", op, column_type="text")
 
 
@@ -321,7 +352,7 @@ def test_row_policy_is_enabled_when_any_part_is_wrong() -> None:
         "r",
         True,
         ("PUBLIC",),
-        (READ.using or "").replace("(team =", "(other ="),
+        (READ.using or "").replace("(t.team =", "(t.other ="),
         None,
     )
     broken["wrong column"] = {"policies": {PASSTHROUGH, wrong_column}}
@@ -339,7 +370,7 @@ def test_policy_ok_accepts_quoted_column_and_rejects_other_table() -> None:
         "r",
         True,
         ("PUBLIC",),
-        READ.using.replace("(team =", '(("Team")::text ='),  # type: ignore[union-attr]
+        READ.using.replace("(t.team =", '((t."Team")::text ='),  # type: ignore[union-attr]
         None,
     )
     assert policy_ok(quoted, "gw_read", op, column_type="character varying")
@@ -522,6 +553,54 @@ async def test_reconcile_strict_raises_on_error_or_failed_fixes() -> None:
         assert raised.value.report.connection == "c"
 
 
+@pytest.mark.parametrize("stage", ["connect", "apply"])
+async def test_reconcile_target_failure_is_sanitized_and_typed_in_reports(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = await metadata.connect(":memory:")
+    try:
+        await metadata.migrate(db)
+        async with metadata.transaction(db):
+            await db.execute(
+                "INSERT INTO connections (name, host, dbname, admin_secret_ref) "
+                "VALUES ('prod', 'h', 'd', 'ref')"
+            )
+        error = TargetUnavailable(
+            "prod", "connect failed", psycopg.OperationalError("PRIVATE_FRAGMENT")
+        )
+        executor = AsyncMock()
+        connector = AsyncMock()
+        if stage == "connect":
+            connector.side_effect = error
+        else:
+            executor.apply.side_effect = ApplyError("prod", None, error)
+            monkeypatch.setattr(
+                "db_gateway.permissions.reconciler._snapshot",
+                AsyncMock(return_value=(ADMIN, ["s"], RELATIONS, state(roles={"g_orphan"}))),
+            )
+            monkeypatch.setattr(
+                "db_gateway.permissions.reconciler.scan.unsafe_views", AsyncMock(return_value=[])
+            )
+            monkeypatch.setattr(
+                "db_gateway.permissions.reconciler.scan.definer_functions",
+                AsyncMock(return_value=[]),
+            )
+        reconciler = Reconciler(db, MemoryStore(), executor, connector, ConnectionLocks())
+        if stage == "connect":
+            with pytest.raises(TargetUnavailable, match="target prod unreachable"):
+                await reconciler.reconcile("prod")
+        report = (await reconciler.reconcile_all(connection="prod"))["prod"]
+        assert report.target_unavailable
+        assert report.error is not None and "target prod unreachable" in report.error
+        assert "PRIVATE_FRAGMENT" not in report.error and "PRIVATE_FRAGMENT" not in caplog.text
+        with pytest.raises(TargetUnavailable if stage == "connect" else ReconcileFailed):
+            await reconciler.reconcile_strict("prod")
+    finally:
+        await db.close()
+
+
 @pytest.mark.parametrize("error_type", [ApplyError, TransientApplyError])
 @pytest.mark.parametrize(
     "sqlstate, has_op, drift",
@@ -557,6 +636,12 @@ async def test_orphan_drop_classifies_only_known_operation_privilege_and_depende
         "db_gateway.permissions.reconciler._snapshot",
         AsyncMock(return_value=(ADMIN, ["s"], RELATIONS, state(roles={"g_orphan"}))),
     )
+    monkeypatch.setattr(
+        "db_gateway.permissions.reconciler.scan.unsafe_views", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        "db_gateway.permissions.reconciler.scan.definer_functions", AsyncMock(return_value=[])
+    )
     db = await metadata.connect(":memory:")
     try:
         await metadata.migrate(db)
@@ -572,14 +657,70 @@ async def test_orphan_drop_classifies_only_known_operation_privilege_and_depende
             (finding,) = report.reported
             assert finding.kind == "undroppable_group_role"
             assert sqlstate is not None and sqlstate in finding.message
-            assert str(original) in finding.message
+            assert safe_error(original) in finding.message
+            assert "original failure" not in finding.message
         else:
             with pytest.raises(ReconcileFailed) as failure:
                 await reconciler.reconcile_strict("prod")
             report = failure.value.report
             assert report.failed == [drop]
-            assert report.error is not None and str(error) in report.error
+            assert report.error is not None and safe_error(error) in report.error
             assert report.reported == []
         executor.apply.assert_awaited_once_with("prod", [drop])
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "scan", "apply"])
+@pytest.mark.parametrize(
+    "original",
+    [
+        psycopg.errors.QueryCanceled("PRIVATE"),
+        psycopg.errors.LockNotAvailable("PRIVATE"),
+        psycopg.errors.DeadlockDetected("PRIVATE"),
+        psycopg.errors.InvalidPassword("PRIVATE"),
+        psycopg.errors.ConnectionFailure("PRIVATE"),
+        psycopg.OperationalError("PRIVATE"),
+        psycopg.ProgrammingError("PRIVATE"),
+        ValueError("PgExecutor requires a fresh idle connection"),
+    ],
+)
+async def test_reconcile_query_and_executor_errors_are_not_target_unavailable(
+    stage: str,
+    original: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    snapshot = AsyncMock(return_value=(ADMIN, ["s"], RELATIONS, state(roles={"g_orphan"})))
+    scan = AsyncMock(return_value=[])
+    executor = AsyncMock()
+    if stage == "snapshot":
+        snapshot.side_effect = original
+    elif stage == "scan":
+        scan.side_effect = original
+    else:
+        executor.apply.side_effect = ApplyError("prod", None, original)
+    monkeypatch.setattr("db_gateway.permissions.reconciler._snapshot", snapshot)
+    monkeypatch.setattr("db_gateway.permissions.reconciler.scan.unsafe_views", scan)
+    monkeypatch.setattr(
+        "db_gateway.permissions.reconciler.scan.definer_functions", AsyncMock(return_value=[])
+    )
+    db = await metadata.connect(":memory:")
+    try:
+        await metadata.migrate(db)
+        async with metadata.transaction(db):
+            await db.execute(
+                "INSERT INTO connections (name, host, dbname, admin_secret_ref) "
+                "VALUES ('prod', 'h', 'd', 'ref')"
+            )
+        reconciler = Reconciler(db, MemoryStore(), executor, AsyncMock(), ConnectionLocks())
+        report = (await reconciler.reconcile_all())["prod"]
+        assert not report.target_unavailable
+        assert report.error is not None and type(original).__name__ in report.error
+        assert type(original).__name__ in caplog.text
+        if isinstance(original, psycopg.Error):
+            assert str(original.sqlstate) in report.error + caplog.text
+            assert "PRIVATE" not in report.error + caplog.text
+        assert report.failed == ([DropGroupRole("g_orphan")] if stage == "apply" else [])
     finally:
         await db.close()

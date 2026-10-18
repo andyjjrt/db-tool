@@ -57,6 +57,7 @@ from psycopg.sql import SQL, Literal
 
 from db_gateway import metadata
 from db_gateway.metadata import audit
+from db_gateway.permissions import scan
 from db_gateway.permissions.actual import ActualState, RowPolicy, read_actual
 from db_gateway.permissions.context import (
     ConnectionInfo,
@@ -64,10 +65,13 @@ from db_gateway.permissions.context import (
     load_connection,
     load_connections,
     mapping_context,
+    safe_error,
 )
 from db_gateway.permissions.executor import ApplyError
 from db_gateway.permissions.executor_protocol import Executor
 from db_gateway.permissions.mapping import grant_ops
+from db_gateway.permissions.rules import TargetUnavailable, controlled_tables, readable_rules
+from db_gateway.permissions.scan import DefinerFunction, UnsafeView
 from db_gateway.permissions.store import PermissionStore, Tuple
 from db_gateway.permissions.types import (
     GW_MANAGED,
@@ -142,6 +146,7 @@ class ReconcileReport:
     skipped: list[PgOp] = field(default_factory=list)
     failed: list[PgOp] = field(default_factory=list)
     error: str | None = None
+    target_unavailable: bool = False
 
 
 # --- expected state (pure) ---
@@ -202,6 +207,13 @@ def _quote_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _ident_forms(name: str) -> set[str]:
+    forms = {_quote_ident(name)}
+    if _SIMPLE_IDENT.fullmatch(name):
+        forms.add(name)  # PG prints simple identifiers unquoted
+    return forms
+
+
 def policy_ok(
     policy: RowPolicy | None, name: str, op: EnableRowPolicy, *, column_type: str | None
 ) -> bool:
@@ -209,7 +221,10 @@ def policy_ok(
 
     The whole expression is compared (ignoring whitespace outside quotes) with the deparsed
     text of the generated policy; the accepted variations are the optional ``AS <name>``
-    aliases of the sub-selects and an unquoted column when it is a simple identifier. The
+    aliases of the sub-selects and an unquoted table or column when it is a simple
+    identifier. ``gw_read`` is wrapped in an outer scalar sub-select so that the column
+    reference is correlated and ParadeDB can still plan its custom scan (needed by
+    ``paradedb.score()``); PG prints the column qualified by the table name. The
     operand is the bare column for a ``text`` column and ``(col)::text`` for any other type
     (``column_type`` from ``actual``; None, a missing column, never matches). The text must
     come from ``actual.read_policies``, which deparses with search_path = pg_catalog, so a
@@ -234,14 +249,16 @@ def policy_ok(
     for alias in (False, True):
         allow = f"gateway_acl.allow_all({args}){' AS allow_all' if alias else ''}"
         values = f"gateway_acl.allowed_values({args}){' AS allowed_values' if alias else ''}"
-        columns = {_quote_ident(op.column)}
-        if _SIMPLE_IDENT.fullmatch(op.column):
-            columns.add(op.column)  # PG prints simple identifiers unquoted
-        for column in columns:
-            operand = column if column_type == "text" else f"({column})::text"
-            expected.add(
-                _squash(f"(( SELECT {allow}) OR ({operand} = ANY (( SELECT {values})::text[])))")
-            )
+        for table in _ident_forms(op.table):
+            for column in _ident_forms(op.column):
+                qualified = f"{table}.{column}"
+                operand = qualified if column_type == "text" else f"({qualified})::text"
+                expected.add(
+                    _squash(
+                        f"( SELECT (( SELECT {allow}) OR "
+                        f"({operand} = ANY (( SELECT {values})::text[]))))"
+                    )
+                )
     return using in expected
 
 
@@ -524,6 +541,43 @@ def _describe(op: PgOp) -> dict[str, object]:
     return {"op": type(op).__name__, **asdict(op)}  # type: ignore[call-overload]
 
 
+def exposure_drift(
+    connection: str,
+    tuples: Collection[Tuple],
+    state: ActualState,
+    views: Collection[UnsafeView],
+    functions: Collection[DefinerFunction],
+) -> list[Drift]:
+    """Report unsafe relations readable through rules or actual group SELECT grants."""
+    reported = []
+    for view in views:
+        readers = readable_rules(view, tuples, connection)
+        granted = [
+            role
+            for schema, table, role in state.table_select
+            if (schema, table) == (view.schema, view.name) and role.startswith("g_")
+        ]
+        if readers or granted:
+            reported.append(
+                Drift(
+                    "unsafe_view",
+                    f"{view.schema}.{view.name} ({view.reason}), owner={view.owner}; "
+                    f"readable by {', '.join(sorted({r.user for r in readers} | set(granted)))}",
+                )
+            )
+    for function in functions:
+        if function.owner_bypasses_rls and function.executable_by_managed:
+            reported.append(
+                Drift(
+                    "definer_function",
+                    f"{function.schema}.{function.name}({function.identity_args}), "
+                    f"owner={function.owner}: bypasses RLS and is executable by gw_managed; "
+                    "change owner or revoke EXECUTE",
+                )
+            )
+    return reported
+
+
 class Reconciler:
     def __init__(
         self,
@@ -556,8 +610,18 @@ class Reconciler:
         ctx = mapping_context(await load_connections(self._db))
         tuples = await self._store.read()
         ops, reported = expected_ops(tuples, ctx, connection)
-        async with await self._connect(connection) as conn:
+        conn = await self._connect(connection)
+        async with conn:
             admin, schemas, relations, state = await _snapshot(conn, info.default_privilege_owners)
+            reported.extend(
+                exposure_drift(
+                    connection,
+                    tuples,
+                    state,
+                    await scan.unsafe_views(conn, controlled_tables(tuples, connection)),
+                    await scan.definer_functions(conn),
+                )
+            )
         plan = diff(
             ops=ops,
             actual=state,
@@ -579,8 +643,15 @@ class Reconciler:
                 try:
                     skipped = await self._executor.apply(connection, batch)
                 except Exception as exc:
+                    error = safe_error(exc)
+                    if isinstance(exc, ApplyError) and isinstance(exc.original, TargetUnavailable):
+                        logger.warning("%s", error)
+                        errors.append(error)
+                        report.target_unavailable = True
+                        report.failed.extend(batch)
+                        continue
                     logger.warning(
-                        "reconcile of %s failed on %s: %s", connection, kind.__name__, exc
+                        "reconcile of %s failed on %s: %s", connection, kind.__name__, error
                     )
                     if (
                         isinstance(batch[0], DropGroupRole)
@@ -593,11 +664,11 @@ class Reconciler:
                             Drift(
                                 "undroppable_group_role",
                                 f"cannot drop role {batch[0].role} "
-                                f"(SQLSTATE {exc.original.sqlstate}): {exc}",
+                                f"(SQLSTATE {exc.original.sqlstate}): {error}",
                             )
                         )
                     else:
-                        errors.append(f"{kind.__name__}: {exc}")
+                        errors.append(f"{kind.__name__}: {error}")
                         report.failed.extend(batch)
                     continue
                 report.skipped.extend(skipped)
@@ -619,15 +690,25 @@ class Reconciler:
         async with metadata.transaction(self._db):
             await audit.record(self._db, "sync", connection_id=info.id, detail=detail)
 
-    async def reconcile_all(self, dry_run: bool = False) -> dict[str, ReconcileReport]:
+    async def reconcile_all(
+        self, dry_run: bool = False, *, connection: str | None = None
+    ) -> dict[str, ReconcileReport]:
         """Every registered connection; one failing connection does not stop the others."""
         results: dict[str, ReconcileReport] = {}
         for info in await load_connections(self._db):
+            if connection is not None and info.name != connection:
+                continue
             try:
                 results[info.name] = await self.reconcile(info.name, dry_run=dry_run)
+            except TargetUnavailable as exc:
+                logger.warning("%s", exc)
+                results[info.name] = ReconcileReport(
+                    info.name, dry_run, error=str(exc), target_unavailable=True
+                )
             except Exception as exc:
-                logger.exception("reconcile of %s failed", info.name)
-                results[info.name] = ReconcileReport(info.name, dry_run, error=str(exc))
+                error = safe_error(exc)
+                logger.warning("reconcile of %s failed: %s", info.name, error)
+                results[info.name] = ReconcileReport(info.name, dry_run, error=error)
         return results
 
     async def run_periodic(self, interval_s: float) -> None:

@@ -165,10 +165,13 @@ def render(op: PgOp) -> list[Composable]:
                     sql.Identifier("gateway_acl", "is_managed"),
                 ),
                 sql.SQL("DROP POLICY IF EXISTS {} ON {}").format(policy_read, qualified_table),
+                # The outer scalar sub-select makes the column reference correlated; with the
+                # bare OR expression ParadeDB cannot plan its custom scan on the table and
+                # paradedb.score() fails. Same rows either way.
                 sql.SQL(
                     "CREATE POLICY {} ON {} FOR SELECT USING "
-                    "((SELECT {}({}, {})) OR {}::text = ANY "
-                    "((SELECT {}({}, {}))::text[]))"
+                    "((SELECT (SELECT {}({}, {})) OR {}::text = ANY "
+                    "((SELECT {}({}, {}))::text[])))"
                 ).format(
                     policy_read,
                     qualified_table,

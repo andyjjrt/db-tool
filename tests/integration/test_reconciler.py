@@ -528,7 +528,9 @@ async def test_orphan_drop_classification_controls_strict_reconcile_and_sync_rec
         report = await world.reconciler.reconcile_strict("target")
         assert report.error is None and report.failed == []
         (drift,) = [d for d in report.reported if d.kind == "undroppable_group_role"]
-        assert blocked in drift.message and str(drop_errors[0].original) in drift.message
+        assert blocked in drift.message
+        assert type(drop_errors[0].original).__name__ in drift.message
+        assert str(drop_errors[0].original) not in drift.message
         assert isinstance(drop_errors[0].original, psycopg.Error)
         sqlstate = "42501" if reason == "privilege" else "2BP01"
         assert drop_errors[0].original.sqlstate == sqlstate

@@ -192,8 +192,8 @@ def test_enable_policy_matches_required_subquery_form() -> None:
     assert statements[4] == 'DROP POLICY IF EXISTS "gw_read" ON "a""b"."events"'
     assert statements[5] == (
         'CREATE POLICY "gw_read" ON "a""b"."events" FOR SELECT USING '
-        '((SELECT "gateway_acl"."allow_all"(\'a"b\', \'events\')) OR "team"::text '
-        '= ANY ((SELECT "gateway_acl"."allowed_values"(\'a"b\', \'events\'))::text[]))'
+        '((SELECT (SELECT "gateway_acl"."allow_all"(\'a"b\', \'events\')) OR "team"::text '
+        '= ANY ((SELECT "gateway_acl"."allowed_values"(\'a"b\', \'events\'))::text[])))'
     )
     assert "TO gw_managed" not in statements[5]
     assert statements[6] == 'GRANT SELECT ON TABLE "a""b"."events" TO "gw_managed"'

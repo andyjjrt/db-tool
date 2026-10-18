@@ -10,7 +10,12 @@ import aiosqlite
 
 from db_gateway import metadata
 from db_gateway.metadata import audit
-from db_gateway.permissions.context import ConnectionLocks, load_connections, mapping_context
+from db_gateway.permissions.context import (
+    ConnectionLocks,
+    load_connections,
+    mapping_context,
+    safe_error,
+)
 from db_gateway.permissions.executor import ApplyError
 from db_gateway.permissions.executor_protocol import Executor
 from db_gateway.permissions.mapping import grant_ops, revoke_ops
@@ -126,7 +131,7 @@ class Syncer:
         *,
         source: str = "stream",
     ) -> None:
-        error = f"{type(exc).__name__}: {exc}"
+        error = safe_error(exc)
         if (
             isinstance(exc, ApplyError)
             and isinstance(exc.op, RevokeMembership)
