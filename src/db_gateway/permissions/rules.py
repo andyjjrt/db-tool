@@ -28,7 +28,7 @@ Errors: ``RuleConflict`` (409), ``NotFound`` (404), ``AdminForbidden`` (403) and
 
 import asyncio
 import re
-from collections.abc import Collection, Sequence, Set
+from collections.abc import Collection, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
@@ -150,7 +150,7 @@ class RuleService:
         partition_stats: PartitionStats,
         *,
         distinct_limit: int = 200,
-        initial_admins: Set[str] = INITIAL_ADMINS,
+        initial_admins: Collection[str] = INITIAL_ADMINS,
         inline: InlineRevoker | None = None,
         revoke_timeout_s: float = 5.0,
         locks: ConnectionLocks | None = None,
@@ -167,6 +167,17 @@ class RuleService:
         self._lock = asyncio.Lock()
         self._locks = locks if locks is not None else ConnectionLocks()
         self._scanner = scanner
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """The instance-wide permission-write lock of plan §2.4.
+
+        Every admin mutation holds it across its permission-store check and its
+        write. The admin user routes (disable, unbind) hold it too, so an admin
+        promotion or removal cannot interleave between a route's target-admin
+        check and its metadata write (gate finding M3).
+        """
+        return self._lock
 
     # --- lookups -------------------------------------------------------------------
 

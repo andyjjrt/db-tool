@@ -28,7 +28,7 @@ async def test_migration_idempotence_and_pragmas(conn: aiosqlite.Connection) -> 
     await migrate(conn)
     async with conn.execute("SELECT * FROM schema_version") as cur:
         assert await cur.fetchall() == before
-    assert len(before) == 1
+    assert len(before) == 2
     async with conn.execute("PRAGMA journal_mode") as cur:
         assert await cur.fetchone() == ("wal",)
     async with conn.execute("PRAGMA foreign_keys") as cur:
@@ -45,6 +45,8 @@ async def test_migration_idempotence_and_pragmas(conn: aiosqlite.Connection) -> 
             "sessions",
             "sync_state",
             "audit_log",
+            "web_sessions",
+            "oidc_login_states",
         }
 
 

@@ -49,7 +49,7 @@ def test_health_and_metadata_lifecycle(monkeypatch: pytest.MonkeyPatch, tmp_path
                     return await cur.fetchall()
 
             assert client.portal is not None
-            assert client.portal.call(schema_version) == [(1,)]
+            assert client.portal.call(schema_version) == [(1,), (2,)]
         with pytest.raises(ValueError, match="no active connection"):
             asyncio.run(schema_version())
     finally:

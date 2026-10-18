@@ -182,16 +182,22 @@ Reconciler 用來偵測 drift，不是防範 DB owner 的安全邊界：DB owner
 
 ## 5. 身分與 admin
 
-- `INITIAL_ADMINS`（`permissions/admin.py`）是寫在程式碼裡的 login key 清單，不讀環境變數。初始 admin 永遠是 admin，不能被移除或停用。
+- `INITIAL_ADMINS`（`permissions/admin.py`）寫在程式碼裡，不讀環境變數：login key 對應一個釘死的 OIDC `sub`。初始 admin 永遠是 admin，不能被移除、停用或 unbind。`sub` 為空表示尚未設定，該初始 admin 不能登入。
 - 一般 admin 存成 `gateway:main#admin` tuple。他們可以新增 admin，但只有初始 admin 能移除 admin、停用 admin 帳號、註冊連線。
-- 登入屬於 M1，還沒實作：`api/auth.py` 的 `current_user` 對所有請求都回 401。M1 會把它換成真正的 session 驗證；測試以 `app.dependency_overrides` 注入使用者。
+- 登入走 OIDC Authorization Code + PKCE（`auth/oidc.py`、`api/auth_routes.py`），任何符合 OIDC 的 IdP 都能用：
+  - 登入中的 state、nonce、PKCE verifier 存在 SQLite（`oidc_login_states`），只能用一次，10 分鐘後失效。每筆登入另外發一個只在 `/auth` 路徑有效的 cookie，callback 必須帶著它，避免別人把自己的 callback 網址丟給受害者。
+  - 使用者以設定的 claim（預設 `preferred_username`）對應 `users.login_key`，第一次登入綁定 `sub`（`users.oidc_sub`，唯一）；之後 `sub` 不符就拒絕。
+  - JWKS 有快取；遇到不認得的 `kid` 才重抓，而且同一時間只抓一次、兩次至少間隔 `DBGW_OIDC_JWKS_MIN_REFRESH_S`。
+- 登入後的 session 存在 SQLite（`web_sessions`），cookie 裡是隨機 token，資料庫只存它的 SHA-256。`current_user`（`api/auth.py`）每個請求都會檢查期限、閒置與 `users.disabled_at`，所以停用帳號在下一個請求就生效。
+- 跨站防護：cookie 是 SameSite=Lax；另外，送到 `/api/` 與 `/auth/logout` 的寫入請求若帶了 `Origin`，必須和 `DBGW_OIDC_REDIRECT_URI` 的 origin 相同。
+- 停用與 unbind 會和新增、移除 admin 共用 RuleService 的鎖，避免檢查完「對方不是 admin」之後對方才被升為 admin。
 
 ## 6. 資料存放
 
 | 位置 | 內容 |
 |---|---|
 | OpenFGA | 所有權限：群組、成員、授權、列級宣告、admin |
-| SQLite（`DBGW_METADATA_DB_PATH`） | `users`、`activations`、`sessions`、`connections`（連線設定與 secret 參照）、`descriptions`（顯示用說明）、`sync_state`（每個連線的同步位置）、`audit_log`（只能新增） |
+| SQLite（`DBGW_METADATA_DB_PATH`） | `users`（含綁定的 `oidc_sub`）、`web_sessions`（登入 session，只存 token hash）、`oidc_login_states`（登入中的 state）、`activations`、`sessions`、`connections`（連線設定與 secret 參照）、`descriptions`（顯示用說明）、`sync_state`（每個連線的同步位置）、`audit_log`（只能新增） |
 | 目標 DB | `gw_managed`、`g_*`、`u_*`、`gateway_acl.*`、各表的 RLS policy |
 | 環境變數 | 連線管理帳號的帳密（`DBGW_SECRET_<REF>`） |
 
@@ -210,7 +216,8 @@ Reconciler 用來偵測 drift，不是防範 DB owner 的安全邊界：DB owner
 
 ## 8. 已知限制
 
-- 登入（M1）尚未實作，管理 API 目前無法實際使用。
+- M1 的開通、個人 role 的 LOGIN／短效密碼與 reaper 尚未實作；停用使用者目前只會結束 gateway 的 session。
+- 登入只登出 gateway，不做 IdP 的 RP-initiated logout。
 - 掃描與分區欄位的 distinct 計數，在全域鎖和連線鎖內執行，而 SQL 查詢本身沒有設 `statement_timeout`。
 - 大群組刪除時，內聯撤銷會逐筆查 OpenFGA，可能慢到回 `pending`，但結果仍然正確。
 - 同一個 PG cluster 只能部署一套 gateway。

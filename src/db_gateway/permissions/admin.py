@@ -1,28 +1,45 @@
 """Admin rules (plan §2.8): who is an admin, and who may change that.
 
-``INITIAL_ADMINS`` is a code constant, not configuration: it is edited in
-code and redeployed, and deliberately not read from the environment. Initial
-admins are always admins; they are not stored in OpenFGA, can never be
-removed from the admin group and can never have their account disabled --
-not even by another initial admin. Everyone else with an ``admin`` relation
-on ``gateway:main`` is an ordinary admin: ordinary admins may add admins, but
-only an initial admin may remove an admin or disable an admin's account.
+``INITIAL_ADMINS`` maps initial-admin login keys to the OIDC subject each is
+pinned to. It is a code constant, not configuration: it is edited in code and
+redeployed, and deliberately not read from the environment. An empty pinned
+subject means "not configured": that initial admin cannot log in until an
+operator pins the subject in this file. A presented subject that differs from
+the pinned one is refused, so a claim rename cannot transfer an initial
+admin's account. Initial admins are always admins; they are not stored in
+OpenFGA, can never be removed from the admin group and can never have their
+account disabled -- not even by another initial admin. Everyone else with an
+``admin`` relation on ``gateway:main`` is an ordinary admin: ordinary admins
+may add admins, but only an initial admin may remove an admin or disable an
+admin's account.
 
 The ``ensure_*`` functions are pure and raise :class:`AdminForbidden` (the
 API maps it to 403); :class:`AdminChecker` and :func:`list_admins` talk to
 the ``PermissionStore``.
 """
 
-from collections.abc import Set
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from db_gateway.permissions import ids
 from db_gateway.permissions.store import PermissionStore, Tuple
 
-# Login keys of the initial administrators, edited in code on purpose: gaining
-# this power is meant to be a code change plus a redeploy, not something the
-# running system can hand out.
-INITIAL_ADMINS: frozenset[str] = frozenset({"andyjjrt"})
+# Login keys of the initial administrators and the OIDC subject each is pinned
+# to, edited in code on purpose: gaining this power is meant to be a code
+# change plus a redeploy, not something the running system can hand out. An
+# empty subject means "not configured"; that account cannot log in. The value
+# is a mapping proxy so runtime code cannot mutate the pinning.
+INITIAL_ADMINS: Mapping[str, str] = MappingProxyType({"andyjjrt": ""})
+
+
+def pinned_subject(login_key: str) -> str | None:
+    """The expected OIDC subject for an initial admin, or None if not one.
+
+    Reads the module global at call time so tests can monkeypatch
+    :data:`INITIAL_ADMINS` without rebuilding default arguments.
+    """
+    return INITIAL_ADMINS.get(login_key)
 
 ADMIN_RELATION = "admin"
 
@@ -53,7 +70,9 @@ class AdminChecker:
     not cached.
     """
 
-    def __init__(self, store: PermissionStore, initial_admins: Set[str] = INITIAL_ADMINS) -> None:
+    def __init__(
+        self, store: PermissionStore, initial_admins: Collection[str] = INITIAL_ADMINS
+    ) -> None:
         self._store = store
         self._initial_admins = initial_admins
         self._cache: dict[int, bool] = {}
@@ -72,7 +91,7 @@ class AdminChecker:
 def ensure_can_remove_admin(
     caller: AdminUser,
     target: AdminUser,
-    initial_admins: Set[str] = INITIAL_ADMINS,
+    initial_admins: Collection[str] = INITIAL_ADMINS,
 ) -> None:
     """Only an initial admin may remove an admin, and never an initial admin."""
     if caller.login_key not in initial_admins:
@@ -85,7 +104,7 @@ def ensure_can_disable_user(
     caller: AdminUser,
     target: AdminUser,
     target_is_admin: bool,
-    initial_admins: Set[str] = INITIAL_ADMINS,
+    initial_admins: Collection[str] = INITIAL_ADMINS,
 ) -> None:
     """Disabling an admin's account requires an initial-admin caller.
 
@@ -120,7 +139,7 @@ class AdminEntry:
 
 
 async def list_admins(
-    store: PermissionStore, initial_admins: Set[str] = INITIAL_ADMINS
+    store: PermissionStore, initial_admins: Collection[str] = INITIAL_ADMINS
 ) -> list[AdminEntry]:
     """Every admin, for GET /api/admin/admins.
 
